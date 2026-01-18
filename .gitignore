@@ -1,0 +1,52 @@
+# Xcode
+build/
+DerivedData/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.xcuserstate
+*.xcscmblueprint
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+.swiftpm/
+
+# CocoaPods (falls verwendet)
+Pods/
+
+# Carthage (falls verwendet)
+Carthage/Build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDEs
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Supabase local
+supabase/.branches
+supabase/.temp
+**/supabase/.temp
+
+# Environment/Secrets (falls vorhanden)
+.env
+.env.local
+*.xcconfig
+!*.xcconfig.template
