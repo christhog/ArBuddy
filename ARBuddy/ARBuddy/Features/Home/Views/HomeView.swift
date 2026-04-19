@@ -2,7 +2,7 @@
 //  HomeView.swift
 //  ARBuddy
 //
-//  Created by Chris Greve on 18.01.26.
+//  Created by Chris Greve on 12.04.26.
 //
 
 import SwiftUI
@@ -10,65 +10,60 @@ import SwiftUI
 struct HomeView: View {
     @EnvironmentObject var supabaseService: SupabaseService
     @StateObject private var viewModel = HomeViewModel()
+    @StateObject private var chatViewModel = ChatViewModel()
     @State private var showSettings = false
-
-    // Fallback user for when not logged in
-    private var displayUser: User {
-        if let appUser = supabaseService.currentUser {
-            return User(
-                id: appUser.id,
-                username: appUser.username,
-                email: appUser.email,
-                xp: appUser.xp,
-                level: appUser.level,
-                completedQuests: []
-            )
-        }
-        return User(
-            username: "Abenteurer",
-            email: "abenteurer@arbuddy.app",
-            xp: 0,
-            level: 1,
-            completedQuests: []
-        )
-    }
+    @State private var showFullChat = false
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 24) {
-                    // 1. Globe Hero Element (interaktiv: drehbar, zoombar)
-                    GlobeView(
-                        countryProgress: viewModel.countryProgress,
-                        isLoading: viewModel.isLoadingCountries
-                    )
-                    .frame(height: 320)
+            ZStack {
+                // Background gradient
+                LinearGradient(
+                    colors: [
+                        Color(.systemBackground),
+                        Color(.systemGray6)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .ignoresSafeArea()
 
-                    // 2. Stats Grid (POIs, XP, Level)
-                    StatsGridView(
-                        user: displayUser,
-                        poiStats: supabaseService.userStatistics
-                    )
-
-                    // 3. Quest-Type Progress (Visits, Photos, AR, Quiz)
-                    if supabaseService.isAuthenticated {
-                        POIProgressSectionView(stats: supabaseService.userStatistics)
+                // Buddy Preview (full screen)
+                VStack(spacing: 0) {
+                    ZStack {
+                        if viewModel.isLoading {
+                            ProgressView()
+                                .scaleEffect(1.5)
+                        } else if let error = viewModel.errorMessage {
+                            VStack(spacing: 12) {
+                                Image(systemName: "exclamationmark.triangle")
+                                    .font(.title)
+                                    .foregroundStyle(.orange)
+                                Text(error)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            BuddyPreviewView(
+                                modelEntity: viewModel.modelEntity,
+                                backgroundColor: .clear,
+                                allowsRotation: true
+                            )
+                        }
                     }
-
-                    // 4. Country Progress Grid
-                    DashboardCardView(title: "Länder-Fortschritt") {
-                        CountryProgressMapView(
-                            countryProgress: viewModel.countryProgress,
-                            isLoading: viewModel.isLoadingCountries
-                        )
-                    }
-
-                    // 5. All Achievements
-                    AchievementsSectionView(stats: supabaseService.userStatistics)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .padding()
+
+                // Mini Chat Overlay at bottom
+                VStack {
+                    Spacer()
+                    MiniChatOverlay(
+                        viewModel: chatViewModel,
+                        showFullChat: $showFullChat
+                    )
+                }
             }
-            .navigationTitle("Home")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -81,20 +76,23 @@ struct HomeView: View {
             .navigationDestination(isPresented: $showSettings) {
                 SettingsView()
             }
-            .task {
-                // Refresh user profile and statistics on appear
-                _ = try? await supabaseService.getUserProfile()
-                await supabaseService.loadUserStatistics()
-
-                // Load country progress from Supabase
-                await viewModel.loadCountryProgress()
+            .sheet(isPresented: $showFullChat) {
+                NavigationStack {
+                    ChatView(viewModel: chatViewModel)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button {
+                                    showFullChat = false
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                }
             }
-            .refreshable {
-                _ = try? await supabaseService.getUserProfile()
-                await supabaseService.loadUserStatistics()
-
-                // Refresh country progress from Supabase
-                await viewModel.loadCountryProgress()
+            .task {
+                await viewModel.loadSelectedBuddy()
             }
         }
     }

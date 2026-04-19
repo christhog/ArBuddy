@@ -2,48 +2,93 @@
 //  HomeViewModel.swift
 //  ARBuddy
 //
-//  Created by Chris Greve on 18.01.26.
+//  Created by Chris Greve on 12.04.26.
 //
 
 import Foundation
+import RealityKit
 import Combine
 
 @MainActor
 class HomeViewModel: ObservableObject {
-    @Published var countryProgress: [CountryProgress] = []
-    @Published var isLoadingCountries = false
+    @Published var currentBuddy: Buddy?
+    @Published var modelEntity: ModelEntity?
+    @Published var isLoading = false
+    @Published var errorMessage: String?
 
     private var cancellables = Set<AnyCancellable>()
 
     init() {
-        // Listen for quest completions to refresh country progress
-        NotificationCenter.default.publisher(for: .questCompleted)
+        // Listen for buddy changes
+        NotificationCenter.default.publisher(for: .buddyChanged)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                Task {
-                    await self?.loadCountryProgress()
+            .sink { [weak self] notification in
+                if let buddy = notification.object as? Buddy {
+                    Task {
+                        await self?.loadBuddy(buddy)
+                    }
                 }
             }
             .store(in: &cancellables)
     }
 
-    /// Load country progress from Supabase
-    func loadCountryProgress() async {
-        isLoadingCountries = true
+    /// Load the user's selected buddy
+    func loadSelectedBuddy() async {
+        isLoading = true
+        errorMessage = nil
 
         do {
-            let statistics = try await SupabaseService.shared.fetchCountryStatistics()
+            // Fetch buddies from Supabase
+            let buddies = try await SupabaseService.shared.fetchBuddies()
 
-            // Convert CountryStatistics to CountryProgress
-            countryProgress = statistics
-                .map { CountryProgress(from: $0) }
-                .sorted { $0.totalQuestsCompleted > $1.totalQuestsCompleted }
+            // Get user's selected buddy ID from UserDefaults
+            let selectedBuddyId = UserDefaults.standard.string(forKey: "selectedBuddyId")
+
+            // Find the selected buddy or use default
+            let buddy: Buddy
+            if let selectedId = selectedBuddyId,
+               let uuid = UUID(uuidString: selectedId),
+               let selected = buddies.first(where: { $0.id == uuid }) {
+                buddy = selected
+            } else if let defaultBuddy = buddies.first(where: { $0.isDefault }) {
+                buddy = defaultBuddy
+            } else if let firstBuddy = buddies.first {
+                buddy = firstBuddy
+            } else {
+                errorMessage = "Kein Buddy gefunden"
+                isLoading = false
+                return
+            }
+
+            await loadBuddy(buddy)
 
         } catch {
-            print("Failed to load country statistics: \(error)")
-            countryProgress = []
+            errorMessage = "Fehler beim Laden: \(error.localizedDescription)"
+            isLoading = false
+        }
+    }
+
+    /// Load a specific buddy model
+    func loadBuddy(_ buddy: Buddy) async {
+        isLoading = true
+        errorMessage = nil
+        currentBuddy = buddy
+
+        do {
+            let entity = try await BuddyAssetService.shared.loadModelEntity(for: buddy)
+            modelEntity = entity
+            print("Buddy model loaded: \(buddy.name)")
+        } catch {
+            errorMessage = "Model konnte nicht geladen werden: \(error.localizedDescription)"
+            print("Failed to load buddy model: \(error)")
         }
 
-        isLoadingCountries = false
+        isLoading = false
     }
+}
+
+// MARK: - Notification Extension
+
+extension Notification.Name {
+    static let buddyChanged = Notification.Name("buddyChanged")
 }

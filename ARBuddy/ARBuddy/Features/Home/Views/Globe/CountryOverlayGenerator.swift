@@ -271,4 +271,5 @@ enum CountryOverlayGenerator {
             context.strokePath()
         }
     }
+
 }

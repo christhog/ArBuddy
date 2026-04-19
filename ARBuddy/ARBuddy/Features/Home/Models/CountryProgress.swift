@@ -39,6 +39,26 @@ struct CountryProgress: Identifiable {
         return max(0.1, completionPercentage)
     }
 
+    /// Estimated XP earned in this country based on quest completions
+    /// XP values: Visit = 50, Photo = 75, AR = 100, Quiz = 100
+    var estimatedXP: Int {
+        let visitXP = visitsCompleted * 50
+        let photoXP = photosCompleted * 75
+        let arXP = arCompleted * 100
+        let quizXP = quizzesCompleted * 100
+        return visitXP + photoXP + arXP + quizXP
+    }
+
+    /// Formatted label text for globe overlay
+    /// Shows "X/Y Quests • Z XP" when progress exists, or "0 Quests" otherwise
+    var overlayLabelText: String {
+        if totalQuestsCompleted > 0 {
+            return "\(totalQuestsCompleted)/\(totalPossibleQuests) Quests • \(estimatedXP) XP"
+        } else {
+            return "0 Quests"
+        }
+    }
+
     /// Generate flag emoji from ISO country code
     var flagEmoji: String {
         let base: UInt32 = 127397

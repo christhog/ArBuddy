@@ -8,6 +8,18 @@
 import Foundation
 import CoreLocation
 
+/// Represents the bounding box of a country's geographic extent
+struct CountryBoundingBox {
+    let minLat: Double
+    let maxLat: Double
+    let minLon: Double
+    let maxLon: Double
+
+    var latSpan: Double { maxLat - minLat }
+    var lonSpan: Double { maxLon - minLon }
+    var maxSpan: Double { max(latSpan, lonSpan) }
+}
+
 /// Represents a country parsed from GeoJSON data
 struct GeoJSONCountry {
     let isoCode: String                           // ISO 3166-1 alpha-2: "DE", "AT", etc.
@@ -100,5 +112,98 @@ enum GeoJSONParser {
                 return CLLocationCoordinate2D(latitude: coord[1], longitude: coord[0])
             }
         }
+    }
+
+    // MARK: - Bounding Box
+
+    /// Calculates the bounding box for a country by its ISO code
+    /// - Parameter countryCode: ISO 3166-1 alpha-2 country code (e.g., "DE", "US")
+    /// - Returns: The bounding box encompassing all the country's territory, or nil if not found
+    static func boundingBox(for countryCode: String) -> CountryBoundingBox? {
+        let countries = parseCountries()
+        guard let country = countries.first(where: { $0.isoCode == countryCode }) else {
+            return nil
+        }
+
+        var minLat = Double.infinity
+        var maxLat = -Double.infinity
+        var minLon = Double.infinity
+        var maxLon = -Double.infinity
+
+        // Iterate through all polygons and their rings
+        for polygon in country.polygons {
+            for ring in polygon {
+                for coord in ring {
+                    minLat = min(minLat, coord.latitude)
+                    maxLat = max(maxLat, coord.latitude)
+                    minLon = min(minLon, coord.longitude)
+                    maxLon = max(maxLon, coord.longitude)
+                }
+            }
+        }
+
+        // Ensure we found valid coordinates
+        guard minLat != Double.infinity else { return nil }
+
+        return CountryBoundingBox(
+            minLat: minLat,
+            maxLat: maxLat,
+            minLon: minLon,
+            maxLon: maxLon
+        )
+    }
+
+    // MARK: - Point-in-Polygon Hit Testing
+
+    /// Cached countries for hit testing
+    private static var cachedCountries: [GeoJSONCountry]?
+
+    /// Finds which country contains the given coordinate
+    /// - Parameters:
+    ///   - lat: Latitude of the point
+    ///   - lon: Longitude of the point
+    /// - Returns: ISO country code if a country is found, nil otherwise
+    static func countryAt(lat: Double, lon: Double) -> String? {
+        // Use cached countries for performance
+        if cachedCountries == nil {
+            cachedCountries = parseCountries()
+        }
+        guard let countries = cachedCountries else { return nil }
+
+        let point = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+
+        for country in countries {
+            for polygon in country.polygons {
+                // Check the outer ring (first element) of each polygon
+                if let outerRing = polygon.first, pointInPolygon(point, polygon: outerRing) {
+                    return country.isoCode
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Ray-casting algorithm to determine if a point is inside a polygon
+    /// - Parameters:
+    ///   - point: The coordinate to test
+    ///   - polygon: Array of coordinates forming the polygon boundary
+    /// - Returns: true if point is inside the polygon
+    private static func pointInPolygon(_ point: CLLocationCoordinate2D, polygon: [CLLocationCoordinate2D]) -> Bool {
+        guard polygon.count >= 3 else { return false }
+
+        var inside = false
+        var j = polygon.count - 1
+
+        for i in 0..<polygon.count {
+            let xi = polygon[i].longitude, yi = polygon[i].latitude
+            let xj = polygon[j].longitude, yj = polygon[j].latitude
+
+            if ((yi > point.latitude) != (yj > point.latitude)) &&
+               (point.longitude < (xj - xi) * (point.latitude - yi) / (yj - yi) + xi) {
+                inside = !inside
+            }
+            j = i
+        }
+        return inside
     }
 }
