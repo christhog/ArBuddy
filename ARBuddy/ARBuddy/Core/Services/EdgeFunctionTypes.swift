@@ -97,6 +97,35 @@ extension CompleteQuestRequest: Encodable {
     }
 }
 
+// MARK: - Complete World Quest Request
+
+struct CompleteWorldQuestRequest: Sendable {
+    let userId: String
+    let worldQuestId: String
+    let xpEarned: Int
+
+    nonisolated init(userId: String, worldQuestId: String, xpEarned: Int) {
+        self.userId = userId
+        self.worldQuestId = worldQuestId
+        self.xpEarned = xpEarned
+    }
+}
+
+extension CompleteWorldQuestRequest: Encodable {
+    enum CodingKeys: String, CodingKey {
+        case userId = "p_user_id"
+        case worldQuestId = "p_world_quest_id"
+        case xpEarned = "p_xp_earned"
+    }
+
+    nonisolated func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(userId, forKey: .userId)
+        try container.encode(worldQuestId, forKey: .worldQuestId)
+        try container.encode(xpEarned, forKey: .xpEarned)
+    }
+}
+
 // MARK: - Quiz Requests
 
 struct QuizRequestByName: Sendable {
@@ -170,6 +199,39 @@ extension POIFetchRequest: Encodable {
     }
 }
 
+// MARK: - POI Fetch Request with Skip Geoapify Option
+
+struct POIFetchRequestWithSkip: Sendable {
+    let latitude: Double
+    let longitude: Double
+    let radius: Double
+    let userId: String?
+    let skipGeoapify: Bool
+
+    nonisolated init(latitude: Double, longitude: Double, radius: Double, userId: String?, skipGeoapify: Bool) {
+        self.latitude = latitude
+        self.longitude = longitude
+        self.radius = radius
+        self.userId = userId
+        self.skipGeoapify = skipGeoapify
+    }
+}
+
+extension POIFetchRequestWithSkip: Encodable {
+    nonisolated func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(latitude, forKey: .latitude)
+        try container.encode(longitude, forKey: .longitude)
+        try container.encode(radius, forKey: .radius)
+        try container.encodeIfPresent(userId, forKey: .userId)
+        try container.encode(skipGeoapify, forKey: .skipGeoapify)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case latitude, longitude, radius, userId, skipGeoapify
+    }
+}
+
 // MARK: - Enrich POI Types
 
 struct EnrichPOIRequest: Sendable {
@@ -224,10 +286,12 @@ struct POIDebugInfo: Sendable, Decodable {
     let newlyInserted: Int?
     let finalCount: Int?
     let geoapifyFetched: Bool?
+    let questCount: Int?
 }
 
 struct POIResponse: Sendable {
     let pois: [EdgePOI]
+    let quests: [EdgePOIQuest]
     let debug: POIDebugInfo?
 }
 
@@ -235,12 +299,43 @@ extension POIResponse: Decodable {
     nonisolated init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         pois = try container.decode([EdgePOI].self, forKey: .pois)
+        quests = try container.decodeIfPresent([EdgePOIQuest].self, forKey: .quests) ?? []
         debug = try container.decodeIfPresent(POIDebugInfo.self, forKey: .debug)
     }
 
     enum CodingKeys: String, CodingKey {
         case pois
+        case quests
         case debug = "_debug"
+    }
+}
+
+// MARK: - POI Quest Response Type
+
+struct EdgePOIQuest: Sendable {
+    let id: String
+    let poiId: String
+    let questType: String
+    let title: String
+    let description: String?
+    let xpReward: Int
+    let difficulty: String
+}
+
+extension EdgePOIQuest: Decodable {
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        poiId = try container.decode(String.self, forKey: .poiId)
+        questType = try container.decode(String.self, forKey: .questType)
+        title = try container.decode(String.self, forKey: .title)
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+        xpReward = try container.decode(Int.self, forKey: .xpReward)
+        difficulty = try container.decode(String.self, forKey: .difficulty)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, poiId, questType, title, description, xpReward, difficulty
     }
 }
 
@@ -302,5 +397,84 @@ extension EdgePOI: Decodable {
     enum CodingKeys: String, CodingKey {
         case id, name, description, category, latitude, longitude
         case geoapifyCategories, street, city, hasQuiz, aiFacts, userProgress
+    }
+}
+
+// MARK: - Chat Completion Request/Response Types
+
+struct ChatCompletionMessage: Sendable {
+    let role: String
+    let content: String
+
+    nonisolated init(role: String, content: String) {
+        self.role = role
+        self.content = content
+    }
+}
+
+extension ChatCompletionMessage: Encodable {
+    nonisolated func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(role, forKey: .role)
+        try container.encode(content, forKey: .content)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case role, content
+    }
+}
+
+struct ChatCompletionRequest: Sendable {
+    let messages: [ChatCompletionMessage]
+    let systemPrompt: String?
+    let maxTokens: Int?
+
+    nonisolated init(messages: [ChatCompletionMessage], systemPrompt: String?, maxTokens: Int?) {
+        self.messages = messages
+        self.systemPrompt = systemPrompt
+        self.maxTokens = maxTokens
+    }
+}
+
+extension ChatCompletionRequest: Encodable {
+    nonisolated func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(messages, forKey: .messages)
+        try container.encodeIfPresent(systemPrompt, forKey: .systemPrompt)
+        try container.encodeIfPresent(maxTokens, forKey: .maxTokens)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case messages, systemPrompt, maxTokens
+    }
+}
+
+// MARK: - Text-to-Speech Request/Response Types
+
+struct TextToSpeechRequest: Sendable {
+    let text: String
+    let voiceName: String?
+    let rate: String?
+    let pitch: String?
+
+    nonisolated init(text: String, voiceName: String? = nil, rate: String? = nil, pitch: String? = nil) {
+        self.text = text
+        self.voiceName = voiceName
+        self.rate = rate
+        self.pitch = pitch
+    }
+}
+
+extension TextToSpeechRequest: Encodable {
+    nonisolated func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(text, forKey: .text)
+        try container.encodeIfPresent(voiceName, forKey: .voiceName)
+        try container.encodeIfPresent(rate, forKey: .rate)
+        try container.encodeIfPresent(pitch, forKey: .pitch)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case text, voiceName, rate, pitch
     }
 }

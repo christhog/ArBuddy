@@ -8,17 +8,19 @@ extension Notification.Name {
 }
 
 // MARK: - App User Model (Supabase-compatible)
-struct AppUser: Identifiable, Codable {
+struct AppUser: Identifiable, Codable, Equatable {
     let id: UUID
     var email: String
     var username: String
     var xp: Int
     var level: Int
     var createdAt: Date
+    var selectedBuddyId: UUID?
 
     enum CodingKeys: String, CodingKey {
         case id, email, username, xp, level
         case createdAt = "created_at"
+        case selectedBuddyId = "selected_buddy_id"
     }
 
     // Computed properties for XP progress
@@ -84,6 +86,76 @@ struct UserPOIStatistics: Codable {
     }
 }
 
+// MARK: - Completed Quest Entry (from user_poi_progress joined with pois)
+
+struct CompletedQuestPOIInfo: Codable {
+    let name: String
+    let category: String
+    let city: String?
+    let description: String?
+    let aiFacts: [String]?
+    let quizDescription: String?
+    let aiDescription: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, category, city, description
+        case aiFacts = "ai_facts"
+        case quizDescription = "quiz_description"
+        case aiDescription = "ai_description"
+    }
+
+    /// Returns quiz description, falling back to ai_description for older quests
+    var effectiveQuizDescription: String? {
+        quizDescription ?? aiDescription
+    }
+}
+
+struct CompletedQuestEntry: Identifiable, Codable {
+    let id: UUID
+    let userId: UUID
+    let poiId: UUID
+    let visitCompleted: Bool
+    let photoCompleted: Bool
+    let arCompleted: Bool
+    let quizCompleted: Bool
+    let quizScore: Int?
+    let xpEarned: Int
+    let updatedAt: Date?
+    let pois: CompletedQuestPOIInfo
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case userId = "user_id"
+        case poiId = "poi_id"
+        case visitCompleted = "visit_completed"
+        case photoCompleted = "photo_completed"
+        case arCompleted = "ar_completed"
+        case quizCompleted = "quiz_completed"
+        case quizScore = "quiz_score"
+        case xpEarned = "xp_earned"
+        case updatedAt = "updated_at"
+        case pois
+    }
+
+    var completedTypes: [String] {
+        var types: [String] = []
+        if visitCompleted { types.append("Besuchen") }
+        if photoCompleted { types.append("Foto") }
+        if arCompleted { types.append("AR") }
+        if quizCompleted { types.append("Quiz") }
+        return types
+    }
+
+    var completedCount: Int {
+        var count = 0
+        if visitCompleted { count += 1 }
+        if photoCompleted { count += 1 }
+        if arCompleted { count += 1 }
+        if quizCompleted { count += 1 }
+        return count
+    }
+}
+
 // MARK: - Supabase Service
 @MainActor
 class SupabaseService: ObservableObject {
@@ -101,6 +173,10 @@ class SupabaseService: ObservableObject {
     @Published var isLoading = false
     @Published var errorMessage: String?
     @Published var userStatistics: UserPOIStatistics = UserPOIStatistics()
+
+    // MARK: - Buddy State
+    @Published var availableBuddies: [Buddy] = []
+    @Published var selectedBuddy: Buddy?
 
     // MARK: - Initialization
     private init() {
@@ -123,15 +199,20 @@ class SupabaseService: ObservableObject {
                     isAuthenticated = true
                     await loadUserProfile(userId: session.user.id)
                     await loadUserStatistics()
+                    await loadBuddyData()
                 } else {
                     isAuthenticated = false
                     currentUser = nil
                     userStatistics = UserPOIStatistics()
+                    availableBuddies = []
+                    selectedBuddy = nil
                 }
             case .signedOut:
                 isAuthenticated = false
                 currentUser = nil
                 userStatistics = UserPOIStatistics()
+                availableBuddies = []
+                selectedBuddy = nil
             default:
                 break
             }
@@ -370,7 +451,7 @@ class SupabaseService: ObservableObject {
             )
         )
 
-        print("Quiz loaded with \(quiz.questions.count) questions")
+        print("Quiz loaded with \(quiz.questions.count) questions, description: \(quiz.description ?? "nil")")
         return quiz
     }
 
@@ -383,7 +464,7 @@ class SupabaseService: ObservableObject {
             )
         )
 
-        print("Quiz loaded with \(quiz.questions.count) questions for POI: \(poiId)")
+        print("Quiz loaded with \(quiz.questions.count) questions for POI: \(poiId), description: \(quiz.description ?? "nil")")
         return quiz
     }
 
@@ -426,23 +507,241 @@ class SupabaseService: ObservableObject {
 
     // MARK: - POI Fetching (via Edge Function)
 
-    func fetchPOIs(latitude: Double, longitude: Double, radius: Double = 5000) async throws -> [EdgePOI] {
+    /// Result type for POI fetch that includes both POIs and quests
+    struct POIFetchResult {
+        let pois: [EdgePOI]
+        let quests: [EdgePOIQuest]
+    }
+
+    func fetchPOIs(latitude: Double, longitude: Double, radius: Double = 5000, skipGeoapify: Bool = false) async throws -> [EdgePOI] {
+        let result = try await fetchPOIsWithQuests(latitude: latitude, longitude: longitude, radius: radius, skipGeoapify: skipGeoapify)
+        return result.pois
+    }
+
+    /// Fetches POIs along with their associated quests from Supabase
+    func fetchPOIsWithQuests(latitude: Double, longitude: Double, radius: Double = 5000, skipGeoapify: Bool = false) async throws -> POIFetchResult {
         let response: POIResponse = try await client.functions.invoke(
             "fetch-pois",
             options: FunctionInvokeOptions(
-                body: POIFetchRequest(
+                body: POIFetchRequestWithSkip(
                     latitude: latitude,
                     longitude: longitude,
                     radius: radius,
-                    userId: currentUser?.id.uuidString
+                    userId: currentUser?.id.uuidString,
+                    skipGeoapify: skipGeoapify
                 )
             )
         )
 
-        print("Loaded \(response.pois.count) POIs from Edge Function")
+        print("[SupabaseService] Loaded \(response.pois.count) POIs with \(response.quests.count) quests (skipGeoapify requested: \(skipGeoapify))")
         if let debug = response.debug {
-            print("[POI Debug] Geoapify: \(debug.geoapifyCount ?? -1), ExistingDB: \(debug.existingInDB ?? -1), NewInserted: \(debug.newlyInserted ?? -1), Final: \(debug.finalCount ?? -1)")
+            print("[POI Debug] GeoapifyFetched: \(debug.geoapifyFetched ?? false), GeoapifyCount: \(debug.geoapifyCount ?? 0), ExistingDB: \(debug.existingInDB ?? 0), NewInserted: \(debug.newlyInserted ?? 0), Final: \(debug.finalCount ?? 0), Quests: \(debug.questCount ?? 0)")
         }
-        return response.pois
+        return POIFetchResult(pois: response.pois, quests: response.quests)
+    }
+
+    // MARK: - POI Fetching (Database Only - No Geoapify)
+
+    /// Fetches POIs directly from the database without calling Geoapify API.
+    /// Use this for pre-fetching at app startup when you only need known POIs.
+    func fetchPOIsFromDatabase(latitude: Double, longitude: Double, radius: Double = 5000) async throws -> [EdgePOI] {
+        // Use the edge function with skipGeoapify flag
+        return try await fetchPOIs(latitude: latitude, longitude: longitude, radius: radius, skipGeoapify: true)
+    }
+
+    // MARK: - POI Quest Fetching
+
+    /// Fetches quests for specific POI IDs directly from Supabase
+    func fetchPOIQuests(poiIds: [UUID]) async throws -> [POIQuest] {
+        guard !poiIds.isEmpty else { return [] }
+
+        struct DBPOIQuest: Codable {
+            let id: UUID
+            let poiId: UUID
+            let questType: String
+            let title: String
+            let description: String?
+            let xpReward: Int
+            let difficulty: String
+
+            enum CodingKeys: String, CodingKey {
+                case id
+                case poiId = "poi_id"
+                case questType = "quest_type"
+                case title
+                case description
+                case xpReward = "xp_reward"
+                case difficulty
+            }
+        }
+
+        let quests: [DBPOIQuest] = try await client
+            .from("poi_quests")
+            .select()
+            .in("poi_id", values: poiIds.map { $0.uuidString })
+            .execute()
+            .value
+
+        return quests.map { dbQuest in
+            POIQuest(
+                id: dbQuest.id,
+                poiId: dbQuest.poiId,
+                questType: QuestType(rawValue: dbQuest.questType) ?? .visit,
+                title: dbQuest.title,
+                description: dbQuest.description,
+                xpReward: dbQuest.xpReward,
+                difficulty: QuestDifficulty(rawValue: dbQuest.difficulty) ?? .easy
+            )
+        }
+    }
+
+    // MARK: - World Quest Fetching
+
+    /// Fetches world quests near a location
+    func fetchWorldQuests(latitude: Double, longitude: Double, radius: Double = 10000) async throws -> [WorldQuest] {
+        let quests: [WorldQuest] = try await client
+            .rpc("world_quests_within_radius", params: [
+                "lat": latitude,
+                "lon": longitude,
+                "radius_meters": radius
+            ])
+            .execute()
+            .value
+
+        print("[SupabaseService] Loaded \(quests.count) world quests")
+        return quests
+    }
+
+    /// Fetches all active world quests
+    func fetchAllActiveWorldQuests() async throws -> [WorldQuest] {
+        let quests: [WorldQuest] = try await client
+            .from("world_quests")
+            .select()
+            .eq("is_active", value: true)
+            .execute()
+            .value
+
+        print("[SupabaseService] Loaded \(quests.count) active world quests")
+        return quests
+    }
+
+    /// Completes a world quest for the current user
+    func completeWorldQuest(worldQuestId: UUID, xpEarned: Int) async throws {
+        guard let userId = currentUser?.id else {
+            throw NSError(domain: "SupabaseService", code: 401, userInfo: [NSLocalizedDescriptionKey: "Nicht eingeloggt"])
+        }
+
+        try await client
+            .rpc("complete_world_quest", params: CompleteWorldQuestRequest(
+                userId: userId.uuidString,
+                worldQuestId: worldQuestId.uuidString,
+                xpEarned: xpEarned
+            ))
+            .execute()
+
+        // Add XP to user
+        try await addXP(xpEarned)
+
+        print("[SupabaseService] Completed world quest: \(worldQuestId)")
+    }
+
+    // MARK: - Completed Quests
+
+    /// Fetches all completed quest progress for the current user, joined with POI data
+    func fetchCompletedQuests(userId: UUID) async throws -> [CompletedQuestEntry] {
+        let entries: [CompletedQuestEntry] = try await client
+            .from("user_poi_progress")
+            .select("*, pois(name, category, city, description, ai_facts, quiz_description, ai_description)")
+            .eq("user_id", value: userId.uuidString)
+            .order("updated_at", ascending: false)
+            .execute()
+            .value
+
+        return entries
+    }
+
+    /// Fetches a single completed quest entry by POI ID for the current user
+    func fetchCompletedQuestEntry(poiId: UUID) async throws -> CompletedQuestEntry? {
+        guard let userId = currentUser?.id else { return nil }
+
+        let entries: [CompletedQuestEntry] = try await client
+            .from("user_poi_progress")
+            .select("*, pois(name, category, city, description, ai_facts, quiz_description, ai_description)")
+            .eq("user_id", value: userId.uuidString)
+            .eq("poi_id", value: poiId.uuidString)
+            .execute()
+            .value
+
+        return entries.first
+    }
+
+    // MARK: - Buddies
+
+    /// Fetches all available buddies from the database
+    func fetchBuddies() async throws -> [Buddy] {
+        let buddies: [Buddy] = try await client
+            .from("buddies")
+            .select()
+            .order("sort_order")
+            .execute()
+            .value
+
+        availableBuddies = buddies
+        print("Loaded \(buddies.count) buddies")
+        return buddies
+    }
+
+    /// Returns the currently selected buddy for the user
+    func getSelectedBuddy() async throws -> Buddy? {
+        // Ensure buddies are loaded
+        if availableBuddies.isEmpty {
+            _ = try await fetchBuddies()
+        }
+
+        // Get buddy ID from current user
+        guard let buddyId = currentUser?.selectedBuddyId else {
+            // Return default buddy if no selection
+            let defaultBuddy = availableBuddies.first { $0.isDefault }
+            selectedBuddy = defaultBuddy
+            return defaultBuddy
+        }
+
+        let buddy = availableBuddies.first { $0.id == buddyId }
+        selectedBuddy = buddy
+        return buddy
+    }
+
+    /// Selects a buddy for the current user
+    func selectBuddy(_ buddy: Buddy) async throws {
+        guard let userId = currentUser?.id else {
+            throw NSError(domain: "SupabaseService", code: 401, userInfo: [NSLocalizedDescriptionKey: "Nicht eingeloggt"])
+        }
+
+        try await client
+            .from("users")
+            .update(["selected_buddy_id": buddy.id.uuidString])
+            .eq("id", value: userId.uuidString)
+            .execute()
+
+        // Update local state
+        selectedBuddy = buddy
+
+        // Update current user's selected buddy ID
+        if var user = currentUser {
+            user.selectedBuddyId = buddy.id
+            currentUser = user
+        }
+
+        print("Selected buddy: \(buddy.name)")
+    }
+
+    /// Loads buddies and sets selected buddy on login
+    func loadBuddyData() async {
+        do {
+            _ = try await fetchBuddies()
+            _ = try await getSelectedBuddy()
+        } catch {
+            print("Failed to load buddy data: \(error)")
+        }
     }
 }
