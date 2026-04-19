@@ -35,7 +35,8 @@ class MapViewModel: ObservableObject {
             }
     }
 
-    /// Lädt POIs für die aktuelle Position
+    /// Lädt POIs für die aktuelle Position (aus DB/Cache, ohne Geoapify)
+    /// Nutzt pre-gefetchte POIs wenn verfügbar
     func loadPOIs(near location: CLLocation, radius: Double = 5000) async {
         print("[MapViewModel] loadPOIs called - isLoadingPOIs: \(isLoadingPOIs)")
 
@@ -56,17 +57,19 @@ class MapViewModel: ObservableObject {
         }
 
         isLoadingPOIs = true
-
         isLoading = true
         errorMessage = nil
 
         do {
+            // Fetch from DB/cache only (skipGeoapify = true)
+            // forceRefresh = false means we use cached/database POIs
             let fetchedPOIs = try await poiService.fetchPOIs(
                 near: location.coordinate,
-                radius: radius
+                radius: radius,
+                forceRefresh: false  // Use cached/DB POIs, no Geoapify call
             )
 
-            print("[MapViewModel] Fetched \(fetchedPOIs.count) POIs")
+            print("[MapViewModel] Fetched \(fetchedPOIs.count) POIs (from DB/cache)")
             self.pois = fetchedPOIs
             self.lastLoadedLocation = location
 
@@ -89,9 +92,51 @@ class MapViewModel: ObservableObject {
         }
     }
 
+    /// Aktualisiert POIs via Geoapify API (für Pull-to-Refresh)
+    /// Ruft Geoapify auf um neue POIs zu entdecken
+    func refreshPOIsFromAPI(near location: CLLocation, radius: Double = 5000) async {
+        print("[MapViewModel] refreshPOIsFromAPI called (force refresh with Geoapify)")
+
+        // Race Condition verhindern
+        if isLoadingPOIs {
+            print("[MapViewModel] Load in progress, skipping force refresh")
+            return
+        }
+
+        isLoadingPOIs = true
+        isLoading = true
+        errorMessage = nil
+
+        do {
+            // Clear cache first to force fresh fetch
+            await poiService.clearCache()
+
+            // Fetch with forceRefresh = true (calls Geoapify API)
+            let fetchedPOIs = try await poiService.fetchPOIs(
+                near: location.coordinate,
+                radius: radius,
+                forceRefresh: true  // Call Geoapify to discover new POIs
+            )
+
+            print("[MapViewModel] Refreshed \(fetchedPOIs.count) POIs (via Geoapify)")
+            self.pois = fetchedPOIs
+            self.lastLoadedLocation = location
+
+            // Regeneriere Quests für die aktualisierten POIs
+            _ = questService.generateQuests(for: fetchedPOIs)
+
+        } catch {
+            print("[MapViewModel] Error refreshing POIs: \(error)")
+            self.errorMessage = error.localizedDescription
+        }
+
+        isLoading = false
+        isLoadingPOIs = false
+    }
+
     /// Gibt die Quests für einen POI zurück
     func quests(for poi: POI) -> [Quest] {
-        return questService.quests(for: poi.id)
+        return questService.legacyQuests(for: poi.id)
     }
 
     /// Berechnet die Distanz zum POI
@@ -113,13 +158,13 @@ class MapViewModel: ObservableObject {
         return pois.filter { $0.category == category }
     }
 
-    /// Filtert POIs nach Kategorie und Fortschritt
-    func filteredPOIs(category: POICategory?, progressFilter: POIProgressFilter) -> [POI] {
+    /// Filtert POIs nach Kategorien und Fortschritt
+    func filteredPOIs(categories: Set<POICategory>, progressFilter: POIProgressFilter) -> [POI] {
         var filtered = pois
 
-        // Filter by category
-        if let category = category {
-            filtered = filtered.filter { $0.category == category }
+        // Filter by categories (empty set = all categories)
+        if !categories.isEmpty {
+            filtered = filtered.filter { categories.contains($0.category) }
         }
 
         // Filter by progress
@@ -166,10 +211,16 @@ class MapViewModel: ObservableObject {
         }
     }
 
-    /// Erzwingt ein Neuladen der POIs
+    /// Erzwingt ein Neuladen der POIs (setzt Cache zurück)
+    /// Nutze refreshPOIsFromAPI() für ein vollständiges Refresh mit Geoapify
     func forceReload() async {
         await poiService.clearCache()
         lastLoadedLocation = nil
+    }
+
+    /// Alias für refreshPOIsFromAPI - für Pull-to-Refresh Gesture
+    func pullToRefresh(near location: CLLocation, radius: Double = 5000) async {
+        await refreshPOIsFromAPI(near: location, radius: radius)
     }
 
     /// Aktualisiert POIs nach Quest-Abschluss

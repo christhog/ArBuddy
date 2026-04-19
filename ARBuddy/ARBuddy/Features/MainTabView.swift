@@ -19,9 +19,9 @@ struct MainTabView: View {
                 }
                 .tag(0)
 
-            ARBuddyView()
+            UserProgressView()
                 .tabItem {
-                    Label("AR", systemImage: "arkit")
+                    Label("Fortschritt", systemImage: "chart.bar.fill")
                 }
                 .tag(1)
 
@@ -36,6 +36,12 @@ struct MainTabView: View {
                     Label("Quests", systemImage: "list.bullet.clipboard")
                 }
                 .tag(3)
+
+            ARBuddyView()
+                .tabItem {
+                    Label("AR", systemImage: "arkit")
+                }
+                .tag(4)
         }
         .environmentObject(mapViewModel)
     }

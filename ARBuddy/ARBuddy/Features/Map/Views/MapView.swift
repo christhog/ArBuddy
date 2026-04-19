@@ -12,7 +12,10 @@ struct MapTabView: View {
     @EnvironmentObject var locationService: LocationService
     @EnvironmentObject var viewModel: MapViewModel
     @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
-    @State private var selectedCategory: POICategory?
+    // Available categories (excluding food and shop)
+    private static let availableCategories: [POICategory] = [.landmark, .culture, .entertainment, .nature, .other]
+    // Default selection (all except nature)
+    @State private var selectedCategories: Set<POICategory> = [.landmark, .culture, .entertainment, .other]
     @State private var selectedFilter: POIProgressFilter = .all
 
     var body: some View {
@@ -21,12 +24,12 @@ struct MapTabView: View {
                 Map(position: $position) {
                     UserAnnotation()
 
-                    ForEach(viewModel.filteredPOIs(category: selectedCategory, progressFilter: selectedFilter)) { poi in
+                    ForEach(viewModel.filteredPOIs(categories: selectedCategories, progressFilter: selectedFilter)) { poi in
                         Annotation(poi.name, coordinate: poi.coordinate) {
                             POIMarkerView(
                                 poi: poi,
                                 isSelected: viewModel.selectedPOI?.id == poi.id,
-                                questCount: viewModel.quests(for: poi).count
+                                quests: QuestService.shared.quests(for: poi.id)
                             )
                             .onTapGesture {
                                 withAnimation {
@@ -52,24 +55,21 @@ struct MapTabView: View {
                 VStack {
                     // Category and Progress Filter
                     VStack(spacing: 8) {
-                        // Category Filter
+                        // Category Filter (Multi-Select)
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 8) {
-                                CategoryChip(
-                                    title: "Alle",
-                                    icon: "mappin",
-                                    isSelected: selectedCategory == nil
-                                ) {
-                                    selectedCategory = nil
-                                }
-
-                                ForEach(POICategory.allCases, id: \.self) { category in
+                                ForEach(Self.availableCategories, id: \.self) { category in
                                     CategoryChip(
                                         title: category.displayName,
                                         icon: category.iconName,
-                                        isSelected: selectedCategory == category
+                                        isSelected: selectedCategories.contains(category)
                                     ) {
-                                        selectedCategory = category
+                                        // Toggle category
+                                        if selectedCategories.contains(category) {
+                                            selectedCategories.remove(category)
+                                        } else {
+                                            selectedCategories.insert(category)
+                                        }
                                     }
                                 }
                             }
@@ -125,7 +125,7 @@ struct MapTabView: View {
                         POIDetailCard(
                             poi: poi,
                             distance: viewModel.distance(to: poi, from: locationService.currentLocation),
-                            questCount: viewModel.quests(for: poi).count
+                            quests: QuestService.shared.quests(for: poi.id)
                         ) {
                             withAnimation {
                                 viewModel.selectedPOI = nil
@@ -143,12 +143,14 @@ struct MapTabView: View {
                     Button(action: {
                         if let location = locationService.currentLocation {
                             Task {
-                                await viewModel.loadPOIs(near: location, radius: 5000)
+                                // Force refresh: call Geoapify to discover new POIs
+                                await viewModel.refreshPOIsFromAPI(near: location, radius: 5000)
                             }
                         }
                     }) {
                         Image(systemName: "arrow.clockwise")
                     }
+                    .disabled(viewModel.isLoading)
                 }
             }
             .onAppear {
@@ -245,17 +247,47 @@ struct CategoryChip: View {
 struct POIMarkerView: View {
     let poi: POI
     let isSelected: Bool
-    let questCount: Int
+    let quests: [POIQuest]
+
+    // Verfügbare Quest-Typen (dedupliziert)
+    private var availableQuestTypes: Set<QuestType> {
+        Set(quests.map { $0.questType })
+    }
+
+    // Anzahl abgeschlossener Quests basierend auf verfügbaren Typen
+    private var completedQuestCount: Int {
+        guard let progress = poi.userProgress else { return 0 }
+        var count = 0
+        for questType in availableQuestTypes {
+            switch questType {
+            case .visit: if progress.visitCompleted { count += 1 }
+            case .photo: if progress.photoCompleted { count += 1 }
+            case .quiz, .trivia: if progress.quizCompleted { count += 1 }
+            case .ar: if progress.arCompleted { count += 1 }
+            }
+        }
+        return count
+    }
+
+    // Fortschritt als Dezimalzahl (0.0 - 1.0)
+    private var progressFraction: Double {
+        guard !availableQuestTypes.isEmpty else { return 0 }
+        return Double(completedQuestCount) / Double(availableQuestTypes.count)
+    }
+
+    // Ist der POI vollständig abgeschlossen?
+    private var isFullyCompleted: Bool {
+        !availableQuestTypes.isEmpty && completedQuestCount == availableQuestTypes.count
+    }
 
     private var progressColor: Color {
-        guard let progress = poi.userProgress else { return .blue }
-        if progress.isFullyCompleted { return .green }
-        if progress.completedCount > 0 { return .orange }
+        if isFullyCompleted { return .green }
+        if completedQuestCount > 0 { return .orange }
         return .blue
     }
 
-    private var showCompletionBadge: Bool {
-        poi.userProgress?.completedCount ?? 0 > 0
+    private var hasProgress: Bool {
+        completedQuestCount > 0
     }
 
     var body: some View {
@@ -265,11 +297,19 @@ struct POIMarkerView: View {
                 .frame(width: 44, height: 44)
                 .shadow(radius: 3)
 
-            // Outer ring for progress
-            if let progress = poi.userProgress, progress.completedCount > 0 {
+            // Progress ring - zeigt Fortschritt als teilweisen Kreis
+            if hasProgress {
+                // Hintergrund-Ring (grau, zeigt den "leeren" Teil)
                 Circle()
-                    .stroke(progressColor, lineWidth: 3)
+                    .stroke(Color.gray.opacity(0.3), lineWidth: 3)
                     .frame(width: 48, height: 48)
+
+                // Fortschritts-Ring (orange/grün, zeigt den "gefüllten" Teil)
+                Circle()
+                    .trim(from: 0, to: progressFraction)
+                    .stroke(progressColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .frame(width: 48, height: 48)
+                    .rotationEffect(.degrees(-90)) // Start oben statt rechts
             }
 
             Image(systemName: poi.category.iconName)
@@ -277,17 +317,17 @@ struct POIMarkerView: View {
                 .font(.system(size: 18))
 
             // Completion badge
-            if showCompletionBadge {
-                Image(systemName: poi.userProgress?.isFullyCompleted == true ? "checkmark.circle.fill" : "circle.lefthalf.filled")
+            if hasProgress {
+                Image(systemName: isFullyCompleted ? "checkmark.circle.fill" : "circle.lefthalf.filled")
                     .foregroundColor(progressColor)
                     .font(.caption)
                     .background(Circle().fill(.white).frame(width: 16, height: 16))
                     .offset(x: 16, y: -16)
             }
 
-            // Quest Badge (only if no completion badge)
-            if !showCompletionBadge && questCount > 0 {
-                Text("\(questCount)")
+            // Quest Badge (only if no progress)
+            if !hasProgress && !quests.isEmpty {
+                Text("\(quests.count)")
                     .font(.caption2)
                     .fontWeight(.bold)
                     .foregroundColor(.white)
@@ -305,8 +345,33 @@ struct POIMarkerView: View {
 struct POIDetailCard: View {
     let poi: POI
     let distance: String?
-    let questCount: Int
+    let quests: [POIQuest]  // Tatsächliche Quests statt questCount
     let onDismiss: () -> Void
+
+    // Computed property für verfügbare Quest-Typen (dedupliziert und sortiert)
+    private var availableQuestTypes: [QuestType] {
+        Array(Set(quests.map { $0.questType })).sorted { $0.rawValue < $1.rawValue }
+    }
+
+    // Anzahl der abgeschlossenen Quests basierend auf verfügbaren Typen
+    private func completedCount(progress: POIProgress) -> Int {
+        var count = 0
+        for questType in availableQuestTypes {
+            switch questType {
+            case .visit: if progress.visitCompleted { count += 1 }
+            case .photo: if progress.photoCompleted { count += 1 }
+            case .quiz, .trivia: if progress.quizCompleted { count += 1 }
+            case .ar: if progress.arCompleted { count += 1 }
+            }
+        }
+        return count
+    }
+
+    // Progress percentage basierend auf verfügbaren Quests
+    private func progressPercentage(progress: POIProgress) -> Double {
+        guard !quests.isEmpty else { return 0 }
+        return Double(completedCount(progress: progress)) / Double(availableQuestTypes.count)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -340,28 +405,41 @@ struct POIDetailCard: View {
                 .foregroundColor(.secondary)
                 .lineLimit(2)
 
-            // Progress Bar (if user has progress)
-            if let progress = poi.userProgress, progress.completedCount > 0 {
+            // Quest Status - zeigt verfügbare Quests und Fortschritt
+            if !quests.isEmpty {
+                let progress = poi.userProgress
+                let completed = progress.map { completedCount(progress: $0) } ?? 0
+                let total = availableQuestTypes.count
+                let isFullyCompleted = completed == total && total > 0
+
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Fortschritt")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Spacer()
-                        Text("\(progress.completedCount)/4 Quests")
+                        Text("\(completed)/\(total) Quests")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
 
-                    ProgressView(value: progress.progressPercentage)
-                        .tint(progress.isFullyCompleted ? .green : .orange)
+                    ProgressView(value: total > 0 ? Double(completed) / Double(total) : 0)
+                        .tint(isFullyCompleted ? .green : .orange)
 
-                    // Quest completion icons
+                    // Quest completion icons - nur für verfügbare Quest-Typen
                     HStack(spacing: 8) {
-                        QuestCompletionIcon(type: .visit, isCompleted: progress.visitCompleted)
-                        QuestCompletionIcon(type: .photo, isCompleted: progress.photoCompleted)
-                        QuestCompletionIcon(type: .ar, isCompleted: progress.arCompleted)
-                        QuestCompletionIcon(type: .trivia, isCompleted: progress.quizCompleted)
+                        ForEach(availableQuestTypes, id: \.rawValue) { questType in
+                            switch questType {
+                            case .visit:
+                                QuestCompletionIcon(type: .visit, isCompleted: progress?.visitCompleted ?? false)
+                            case .photo:
+                                QuestCompletionIcon(type: .photo, isCompleted: progress?.photoCompleted ?? false)
+                            case .quiz, .trivia:
+                                QuestCompletionIcon(type: .trivia, isCompleted: progress?.quizCompleted ?? false)
+                            case .ar:
+                                QuestCompletionIcon(type: .ar, isCompleted: progress?.arCompleted ?? false)
+                            }
+                        }
                     }
                 }
             }
@@ -373,14 +451,14 @@ struct POIDetailCard: View {
 
                 Spacer()
 
-                if questCount > 0 {
-                    Label("\(questCount) Quest\(questCount == 1 ? "" : "s")", systemImage: "list.bullet")
+                if !quests.isEmpty {
+                    Label("\(quests.count) Quest\(quests.count == 1 ? "" : "s")", systemImage: "list.bullet")
                         .font(.caption)
                         .foregroundColor(.orange)
                 }
             }
 
-            if questCount > 0 {
+            if !quests.isEmpty {
                 NavigationLink(destination: POIQuestsView(poi: poi)) {
                     Text("Quests anzeigen")
                         .font(.subheadline)
@@ -421,7 +499,7 @@ struct QuestCompletionIcon: View {
         case .visit: return isCompleted ? "mappin.circle.fill" : "mappin.circle"
         case .photo: return isCompleted ? "camera.fill" : "camera"
         case .ar: return "arkit"
-        case .trivia: return isCompleted ? "checkmark.circle.fill" : "questionmark.circle"
+        case .quiz, .trivia: return isCompleted ? "checkmark.circle.fill" : "questionmark.circle"
         }
     }
 }
@@ -432,6 +510,13 @@ struct POIQuestsView: View {
     let poi: POI
     @StateObject private var viewModel = QuestsViewModel()
     @EnvironmentObject var locationService: LocationService
+    @State private var selectedQuizQuest: Quest?
+    @State private var selectedCompletedEntry: CompletedQuestEntry?
+    @State private var isLoadingCompletedEntry = false
+
+    private var quests: [Quest] {
+        QuestService.shared.legacyQuests(for: poi.id)
+    }
 
     var body: some View {
         List {
@@ -451,10 +536,12 @@ struct POIQuestsView: View {
                             .foregroundColor(.secondary)
                     }
 
-                    if let progress = poi.userProgress {
-                        ProgressView(value: progress.progressPercentage)
-                            .tint(progress.isFullyCompleted ? .green : .orange)
-                        Text("\(progress.completedCount)/4 Quests abgeschlossen")
+                    if let progress = poi.userProgress, !quests.isEmpty {
+                        let totalQuests = quests.count
+                        let completedQuests = countCompletedQuests(progress: progress)
+                        ProgressView(value: Double(completedQuests) / Double(totalQuests))
+                            .tint(completedQuests == totalQuests ? .green : .orange)
+                        Text("\(completedQuests)/\(totalQuests) Quests abgeschlossen")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -462,18 +549,92 @@ struct POIQuestsView: View {
             }
 
             // Quests Section
-            Section("Verfügbare Quests") {
-                ForEach(QuestService.shared.quests(for: poi.id)) { quest in
+            Section("Quests") {
+                ForEach(quests) { quest in
+                    let isCompleted = isQuestCompleted(quest)
                     QuestRowView(
                         quest: quest,
                         distance: viewModel.distance(to: quest, from: locationService.currentLocation),
-                        isInRange: viewModel.isInRange(of: quest, userLocation: locationService.currentLocation)
+                        isInRange: viewModel.isInRange(of: quest, userLocation: locationService.currentLocation),
+                        isCompleted: isCompleted
                     )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        handleQuestTap(quest, isCompleted: isCompleted)
+                    }
                 }
             }
         }
         .navigationTitle(poi.name)
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $selectedQuizQuest) { quest in
+            QuizView(
+                poiId: quest.poiId,
+                poiName: quest.title,
+                category: "Sehenswürdigkeit",
+                xpPerQuestion: quest.calculatedXPReward / 5
+            )
+        }
+        .sheet(item: $selectedCompletedEntry) { entry in
+            NavigationStack {
+                CompletedQuestDetailView(entry: entry)
+            }
+        }
+        .overlay {
+            if isLoadingCompletedEntry {
+                ProgressView()
+                    .scaleEffect(1.5)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black.opacity(0.2))
+            }
+        }
+    }
+
+    private func isQuestCompleted(_ quest: Quest) -> Bool {
+        guard let progress = poi.userProgress else { return false }
+        switch quest.type {
+        case .visit: return progress.visitCompleted
+        case .photo: return progress.photoCompleted
+        case .ar: return progress.arCompleted
+        case .quiz, .trivia: return progress.quizCompleted
+        }
+    }
+
+    // Zählt abgeschlossene Quests basierend auf den tatsächlich verfügbaren Quest-Typen
+    private func countCompletedQuests(progress: POIProgress) -> Int {
+        let questTypes = Set(quests.map { $0.type })
+        var count = 0
+        for questType in questTypes {
+            switch questType {
+            case .visit: if progress.visitCompleted { count += 1 }
+            case .photo: if progress.photoCompleted { count += 1 }
+            case .quiz, .trivia: if progress.quizCompleted { count += 1 }
+            case .ar: if progress.arCompleted { count += 1 }
+            }
+        }
+        return count
+    }
+
+    private func handleQuestTap(_ quest: Quest, isCompleted: Bool) {
+        if isCompleted {
+            // Show completed quest detail
+            isLoadingCompletedEntry = true
+            Task {
+                do {
+                    if let entry = try await SupabaseService.shared.fetchCompletedQuestEntry(poiId: poi.id) {
+                        selectedCompletedEntry = entry
+                    }
+                } catch {
+                    print("Failed to fetch completed quest entry: \(error)")
+                }
+                isLoadingCompletedEntry = false
+            }
+        } else {
+            // Only open quiz for uncompleted quiz/trivia quests
+            if quest.type == .quiz || quest.type == .trivia {
+                selectedQuizQuest = quest
+            }
+        }
     }
 }
 
