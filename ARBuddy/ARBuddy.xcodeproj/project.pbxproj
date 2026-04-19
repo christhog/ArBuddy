@@ -7,11 +7,16 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0337555A327047B4E151BA74 /* Pods_ARBuddy.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 019FCDD9F8479D622DC1855A /* Pods_ARBuddy.framework */; };
 		7E17EC1B2F1A966C0040E3E9 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = 7E17EC1A2F1A966C0040E3E9 /* Supabase */; };
+		7ELLM0032F1B00000040E3E9 /* LLM in Frameworks */ = {isa = PBXBuildFile; productRef = 7ELLM0022F1B00000040E3E9 /* LLM */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		019FCDD9F8479D622DC1855A /* Pods_ARBuddy.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_ARBuddy.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		7E956EE22F1A74CA00049CC4 /* ARBuddy.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ARBuddy.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A230B9761C8A77B9661B4EFE /* Pods-ARBuddy.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-ARBuddy.release.xcconfig"; path = "Target Support Files/Pods-ARBuddy/Pods-ARBuddy.release.xcconfig"; sourceTree = "<group>"; };
+		AC88AF5E9E405C2740D42266 /* Pods-ARBuddy.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-ARBuddy.debug.xcconfig"; path = "Target Support Files/Pods-ARBuddy/Pods-ARBuddy.debug.xcconfig"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -28,15 +33,27 @@
 			buildActionMask = 2147483647;
 			files = (
 				7E17EC1B2F1A966C0040E3E9 /* Supabase in Frameworks */,
+				7ELLM0032F1B00000040E3E9 /* LLM in Frameworks */,
+				0337555A327047B4E151BA74 /* Pods_ARBuddy.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		0C4FEB00968B00FCD31DB62F /* Pods */ = {
+			isa = PBXGroup;
+			children = (
+				AC88AF5E9E405C2740D42266 /* Pods-ARBuddy.debug.xcconfig */,
+				A230B9761C8A77B9661B4EFE /* Pods-ARBuddy.release.xcconfig */,
+			);
+			path = Pods;
+			sourceTree = "<group>";
+		};
 		7E17EC192F1A966C0040E3E9 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				019FCDD9F8479D622DC1855A /* Pods_ARBuddy.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -47,6 +64,7 @@
 				7E956EE42F1A74CA00049CC4 /* ARBuddy */,
 				7E17EC192F1A966C0040E3E9 /* Frameworks */,
 				7E956EE32F1A74CA00049CC4 /* Products */,
+				0C4FEB00968B00FCD31DB62F /* Pods */,
 			);
 			sourceTree = "<group>";
 		};
@@ -65,9 +83,11 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 7E956EED2F1A74CC00049CC4 /* Build configuration list for PBXNativeTarget "ARBuddy" */;
 			buildPhases = (
+				DBC98608B008AD83DBE85329 /* [CP] Check Pods Manifest.lock */,
 				7E956EDE2F1A74CA00049CC4 /* Sources */,
 				7E956EDF2F1A74CA00049CC4 /* Frameworks */,
 				7E956EE02F1A74CA00049CC4 /* Resources */,
+				CBD08F21DE0F1D8477B4FD9C /* [CP] Embed Pods Frameworks */,
 			);
 			buildRules = (
 			);
@@ -79,6 +99,7 @@
 			name = ARBuddy;
 			packageProductDependencies = (
 				7E17EC1A2F1A966C0040E3E9 /* Supabase */,
+				7ELLM0022F1B00000040E3E9 /* LLM */,
 			);
 			productName = ARBuddy;
 			productReference = 7E956EE22F1A74CA00049CC4 /* ARBuddy.app */;
@@ -110,6 +131,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				7E956F552F1A8A5100049CC4 /* XCRemoteSwiftPackageReference "supabase-swift" */,
+				7ELLM0012F1B00000040E3E9 /* XCRemoteSwiftPackageReference "LLM" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 7E956EE32F1A74CA00049CC4 /* Products */;
@@ -130,6 +152,52 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		CBD08F21DE0F1D8477B4FD9C /* [CP] Embed Pods Frameworks */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-ARBuddy/Pods-ARBuddy-frameworks-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			inputPaths = (
+			);
+			name = "[CP] Embed Pods Frameworks";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-ARBuddy/Pods-ARBuddy-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-ARBuddy/Pods-ARBuddy-frameworks.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		DBC98608B008AD83DBE85329 /* [CP] Check Pods Manifest.lock */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${PODS_PODFILE_DIR_PATH}/Podfile.lock",
+				"${PODS_ROOT}/Manifest.lock",
+			);
+			name = "[CP] Check Pods Manifest.lock";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/Pods-ARBuddy-checkManifestLockResult.txt",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		7E956EDE2F1A74CA00049CC4 /* Sources */ = {
@@ -265,18 +333,22 @@
 		};
 		7E956EEE2F1A74CC00049CC4 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = AC88AF5E9E405C2740D42266 /* Pods-ARBuddy.debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = RGPSY7B7R8;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "ARBuddy benötigt Kamera-Zugriff für AR-Erlebnisse und Foto-Quests.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "ARBuddy benötigt deinen Standort, um dir nahegelegene Quests und POIs zu zeigen.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "ARBuddy benötigt deinen Standort, um dir nahegelegene Quests und POIs zu zeigen.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "ARBuddy benötigt Mikrofon-Zugriff für die Spracheingabe beim Chat mit deinem Buddy.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "ARBuddy benötigt Zugriff auf deine Fotos, um Quest-Fotos zu speichern.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "ARBuddy benötigt Spracherkennung für die Spracheingabe beim Chat mit deinem Buddy.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = arkit;
@@ -287,7 +359,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = christhog.ARBuddy;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -302,18 +374,22 @@
 		};
 		7E956EEF2F1A74CC00049CC4 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = A230B9761C8A77B9661B4EFE /* Pods-ARBuddy.release.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = RGPSY7B7R8;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "ARBuddy benötigt Kamera-Zugriff für AR-Erlebnisse und Foto-Quests.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "ARBuddy benötigt deinen Standort, um dir nahegelegene Quests und POIs zu zeigen.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "ARBuddy benötigt deinen Standort, um dir nahegelegene Quests und POIs zu zeigen.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "ARBuddy benötigt Mikrofon-Zugriff für die Spracheingabe beim Chat mit deinem Buddy.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "ARBuddy benötigt Zugriff auf deine Fotos, um Quest-Fotos zu speichern.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "ARBuddy benötigt Spracherkennung für die Spracheingabe beim Chat mit deinem Buddy.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = arkit;
@@ -324,7 +400,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = christhog.ARBuddy;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -369,6 +445,14 @@
 				minimumVersion = 2.5.1;
 			};
 		};
+		7ELLM0012F1B00000040E3E9 /* XCRemoteSwiftPackageReference "LLM" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/eastriverlee/LLM.swift";
+			requirement = {
+				branch = main;
+				kind = branch;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -376,6 +460,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 7E956F552F1A8A5100049CC4 /* XCRemoteSwiftPackageReference "supabase-swift" */;
 			productName = Supabase;
+		};
+		7ELLM0022F1B00000040E3E9 /* LLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 7ELLM0012F1B00000040E3E9 /* XCRemoteSwiftPackageReference "LLM" */;
+			productName = LLM;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
