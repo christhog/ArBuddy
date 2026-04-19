@@ -50,3 +50,10 @@ supabase/.temp
 .env.local
 *.xcconfig
 !*.xcconfig.template
+
+# Claude Code (per-user settings, worktrees)
+.claude/
+
+# Raw DCC source assets (shipped USDZ lives under ARBuddy/)
+Micoo/
+Jona/
