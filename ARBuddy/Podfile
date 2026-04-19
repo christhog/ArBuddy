@@ -1,0 +1,27 @@
+# ARBuddy Podfile
+#
+# Azure Speech SDK for Viseme-based Lip Sync
+# Note: The SDK requires a PAID Azure Speech Services subscription for viseme support.
+# Free tier (F0) does not provide viseme data.
+
+platform :ios, '15.0'
+use_frameworks!
+
+target 'ARBuddy' do
+  # Azure Speech SDK for native TTS with real viseme events
+  pod 'MicrosoftCognitiveServicesSpeech-iOS', '~> 1.43.0'
+
+  # Note:
+  # 1. Run 'pod install' in this directory after adding
+  # 2. Open ARBuddy.xcworkspace (not .xcodeproj)
+  # 3. The SDK adds ~50MB to app size
+  # 4. Auth happens via the azure-speech-token Edge Function — no client-side key
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+    end
+  end
+end
