@@ -12,6 +12,7 @@ class QuizViewModel: ObservableObject {
     @Published var correctAnswersCount = 0
     @Published var isQuizComplete = false
     @Published var quizResult: QuizResult?
+    @Published var showIntro = true
 
     @Published var isLoading = false
     @Published var errorMessage: String?
@@ -98,6 +99,12 @@ class QuizViewModel: ObservableObject {
         isLoading = false
     }
 
+    // MARK: - Quiz Flow
+
+    func startQuiz() {
+        showIntro = false
+    }
+
     // MARK: - Quiz Interaction
 
     func selectAnswer(_ index: Int) {
@@ -174,6 +181,7 @@ class QuizViewModel: ObservableObject {
         correctAnswersCount = 0
         isQuizComplete = false
         quizResult = nil
+        showIntro = true
         isLoading = false
         errorMessage = nil
     }

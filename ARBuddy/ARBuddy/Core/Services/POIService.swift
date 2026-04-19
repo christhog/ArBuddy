@@ -15,29 +15,99 @@ actor POIService {
 
     private init() {}
 
+    /// Generates a cache key that rounds coordinates to ~11m precision (4 decimal places)
+    /// This ensures that nearby locations hit the same cache
+    private func cacheKey(for coordinate: CLLocationCoordinate2D, radius: Double) -> String {
+        // Round to 4 decimal places (~11m precision)
+        let roundedLat = (coordinate.latitude * 10000).rounded() / 10000
+        let roundedLon = (coordinate.longitude * 10000).rounded() / 10000
+        return "\(roundedLat),\(roundedLon),\(radius)"
+    }
+
     /// Lädt POIs in einem bestimmten Radius um eine Koordinate (via Supabase Edge Function)
+    /// - Parameters:
+    ///   - coordinate: Die Koordinate um die herum gesucht wird
+    ///   - radius: Der Suchradius in Metern (Standard: 5000m)
+    ///   - categories: Die zu suchenden Kategorien
+    ///   - forceRefresh: Wenn true, wird Geoapify aufgerufen um neue POIs zu entdecken
     func fetchPOIs(
         near coordinate: CLLocationCoordinate2D,
         radius: Double = 5000,
-        categories: [POICategory] = POICategory.allCases
+        categories: [POICategory] = POICategory.allCases,
+        forceRefresh: Bool = false
     ) async throws -> [POI] {
-        let cacheKey = "\(coordinate.latitude),\(coordinate.longitude),\(radius)"
+        let key = cacheKey(for: coordinate, radius: radius)
 
-        if let cached = cache[cacheKey] {
+        if let cached = cache[key], !forceRefresh {
+            print("[POIService] Cache hit for key: \(key) (\(cached.count) POIs)")
             return cached
         }
 
-        print("Fetching POIs via Edge Function...")
+        print("Fetching POIs via Edge Function (forceRefresh: \(forceRefresh))...")
 
-        // Fetch via Supabase Edge Function
-        let edgePOIs = try await SupabaseService.shared.fetchPOIs(
+        // Fetch via Supabase Edge Function (includes quests)
+        // skipGeoapify = !forceRefresh (only call Geoapify on force refresh)
+        let result = try await SupabaseService.shared.fetchPOIsWithQuests(
             latitude: coordinate.latitude,
             longitude: coordinate.longitude,
-            radius: radius
+            radius: radius,
+            skipGeoapify: !forceRefresh
         )
 
         // Convert EdgePOI to POI
-        let pois = edgePOIs.compactMap { edgePOI -> POI? in
+        let pois = convertEdgePOIsToPOIs(result.pois)
+
+        // Load quests into QuestService
+        await MainActor.run {
+            QuestService.shared.loadPOIQuests(from: result.quests)
+        }
+
+        print("[POIService] Loaded \(pois.count) POIs with \(result.quests.count) quests, caching with key: \(key)")
+        cache[key] = pois
+
+        return pois
+    }
+
+    /// Lädt POIs nur aus der Datenbank (ohne Geoapify API-Aufruf)
+    /// Verwendet für Pre-Fetching beim App-Start
+    func fetchPOIsFromDatabase(
+        near coordinate: CLLocationCoordinate2D,
+        radius: Double = 5000
+    ) async throws -> [POI] {
+        let key = cacheKey(for: coordinate, radius: radius)
+
+        if let cached = cache[key] {
+            print("[POIService] Pre-fetch cache hit for key: \(key) (\(cached.count) POIs)")
+            return cached
+        }
+
+        print("[POIService] Pre-fetching POIs from database only...")
+
+        // Fetch from database only (skipGeoapify = true) - includes quests
+        let result = try await SupabaseService.shared.fetchPOIsWithQuests(
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude,
+            radius: radius,
+            skipGeoapify: true
+        )
+
+        // Convert EdgePOI to POI
+        let pois = convertEdgePOIsToPOIs(result.pois)
+
+        // Load quests into QuestService
+        await MainActor.run {
+            QuestService.shared.loadPOIQuests(from: result.quests)
+        }
+
+        print("[POIService] Pre-fetched \(pois.count) POIs with \(result.quests.count) quests from database, caching with key: \(key)")
+        cache[key] = pois
+
+        return pois
+    }
+
+    /// Converts EdgePOI array to POI array
+    private func convertEdgePOIsToPOIs(_ edgePOIs: [EdgePOI]) -> [POI] {
+        return edgePOIs.compactMap { edgePOI -> POI? in
             // Parse UUID from string
             guard let id = UUID(uuidString: edgePOI.id) else {
                 print("Invalid POI ID: \(edgePOI.id)")
@@ -73,11 +143,6 @@ actor POIService {
                 geoapifyCategories: edgePOI.geoapifyCategories
             )
         }
-
-        print("Loaded \(pois.count) POIs")
-        cache[cacheKey] = pois
-
-        return pois
     }
 
     /// Updates progress for a specific POI in the cache

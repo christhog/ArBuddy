@@ -59,6 +59,26 @@ interface POIResponse {
   aiFacts: string[] | null;
 }
 
+interface POIQuestDB {
+  id: string;
+  poi_id: string;
+  quest_type: string;
+  title: string;
+  description: string | null;
+  xp_reward: number;
+  difficulty: string;
+}
+
+interface POIQuestResponse {
+  id: string;
+  poiId: string;
+  questType: string;
+  title: string;
+  description: string | null;
+  xpReward: number;
+  difficulty: string;
+}
+
 Deno.serve(async (req) => {
   // Handle CORS preflight
   if (req.method === "OPTIONS") {
@@ -66,7 +86,7 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const { latitude, longitude, radius, userId } = await req.json();
+    const { latitude, longitude, radius, userId, skipGeoapify } = await req.json();
 
     // Validate input
     if (typeof latitude !== "number" || typeof longitude !== "number") {
@@ -77,6 +97,7 @@ Deno.serve(async (req) => {
     }
 
     const searchRadius = radius || 5000;
+    const shouldSkipGeoapify = skipGeoapify === true;
 
     // Initialize Supabase client
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
@@ -108,14 +129,16 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ========== Step 2 - Always fetch from Geoapify to discover new POIs ==========
-    const shouldFetchFromGeoapify = true; // Always call Geoapify
+    // ========== Step 2 - Fetch from Geoapify to discover new POIs (only on manual refresh) ==========
+    // skipGeoapify = true: Only return POIs from database (fast, for normal loads)
+    // skipGeoapify = false: Call Geoapify to discover new POIs (only on manual refresh button)
+    const shouldFetchFromGeoapify = !shouldSkipGeoapify;
     let geoapifyFetched = false;
     let geoapifyCount = 0;
     let insertedCount = 0;
 
     if (shouldFetchFromGeoapify) {
-      console.log(`Fetching from Geoapify to discover new POIs (${existingDBPOIs.length} already in DB)...`);
+      console.log(`Fetching from Geoapify (manual refresh requested)`);
 
       const geoapifyApiKey = Deno.env.get("GEOAPIFY_API_KEY");
       if (!geoapifyApiKey) {
@@ -259,12 +282,26 @@ Deno.serve(async (req) => {
                   existingPOIMap.set(poi.geoapify_place_id, poi);
                 }
               }
+
+              // Generate quests for newly inserted POIs
+              console.log(`Generating quests for ${insertedCount} new POIs`);
+              for (const poi of insertedPOIs) {
+                const { error: questError } = await supabase.rpc('generate_poi_quests', {
+                  p_poi_id: poi.id
+                });
+                if (questError) {
+                  console.error(`Failed to generate quests for POI ${poi.id}:`, questError);
+                }
+              }
+              console.log(`Quest generation complete for ${insertedCount} POIs`);
             }
           } else {
             console.log("No new POIs to insert from Geoapify");
           }
         }
       }
+    } else {
+      console.log(`Returning ${existingDBPOIs.length} POIs from database only (skipGeoapify=true)`);
     }
 
     // ========== Step 3 - Get user progress if userId is provided ==========
@@ -301,8 +338,42 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ========== Step 4 - Build response from database POIs ==========
+    // ========== Step 4 - Fetch quests for all POIs ==========
+    const poiIds = existingDBPOIs.map(p => p.id);
+    const questMap = new Map<string, POIQuestResponse[]>();
+
+    if (poiIds.length > 0) {
+      const { data: questsData, error: questsError } = await supabase
+        .from('poi_quests')
+        .select('*')
+        .in('poi_id', poiIds);
+
+      if (questsError) {
+        console.error("Failed to fetch quests:", questsError);
+      } else if (questsData) {
+        console.log(`Loaded ${questsData.length} quests for ${poiIds.length} POIs`);
+        for (const quest of questsData as POIQuestDB[]) {
+          const questResponse: POIQuestResponse = {
+            id: quest.id,
+            poiId: quest.poi_id,
+            questType: quest.quest_type,
+            title: quest.title,
+            description: quest.description,
+            xpReward: quest.xp_reward,
+            difficulty: quest.difficulty,
+          };
+
+          if (!questMap.has(quest.poi_id)) {
+            questMap.set(quest.poi_id, []);
+          }
+          questMap.get(quest.poi_id)!.push(questResponse);
+        }
+      }
+    }
+
+    // ========== Step 5 - Build response from database POIs ==========
     const pois: (POIResponse & { userProgress?: { visitCompleted: boolean; photoCompleted: boolean; arCompleted: boolean; quizCompleted: boolean; quizScore: number | null } })[] = [];
+    const quests: POIQuestResponse[] = [];
 
     for (const dbPOI of existingDBPOIs) {
       const result: POIResponse & { userProgress?: { visitCompleted: boolean; photoCompleted: boolean; arCompleted: boolean; quizCompleted: boolean; quizScore: number | null } } = {
@@ -326,20 +397,28 @@ Deno.serve(async (req) => {
       }
 
       pois.push(result);
+
+      // Add quests for this POI to the quests array
+      const poiQuests = questMap.get(dbPOI.id);
+      if (poiQuests) {
+        quests.push(...poiQuests);
+      }
     }
 
-    console.log(`Returning ${pois.length} total POIs (DB-First)`);
+    console.log(`Returning ${pois.length} POIs with ${quests.length} quests (geoapifyFetched: ${geoapifyFetched})`);
 
     return new Response(
       JSON.stringify({
         pois,
+        quests,
         _debug: {
-          dbFirst: true,
-          existingInDB: existingDBPOIs.length - insertedCount,
+          skipGeoapify: shouldSkipGeoapify,
           geoapifyFetched,
+          existingInDB: existingDBPOIs.length - insertedCount,
           geoapifyCount,
           newlyInserted: insertedCount,
           finalCount: pois.length,
+          questCount: quests.length,
         }
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }

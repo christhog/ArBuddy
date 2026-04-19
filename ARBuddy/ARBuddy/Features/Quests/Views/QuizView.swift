@@ -31,6 +31,15 @@ struct QuizView: View {
                             await viewModel.loadQuiz()
                         }
                     }
+                } else if viewModel.showIntro, viewModel.quiz != nil {
+                    QuizIntroView(
+                        poiName: poiName,
+                        description: viewModel.quiz?.description,
+                        questionCount: viewModel.quiz?.questionCount ?? 5,
+                        onStart: {
+                            viewModel.startQuiz()
+                        }
+                    )
                 } else if viewModel.isQuizComplete, let result = viewModel.quizResult {
                     QuizResultView(result: result) {
                         dismiss()
@@ -188,6 +197,31 @@ struct QuizQuestionView: View {
                         }
                     }
                     .padding(.horizontal)
+
+                    // Explanation after answer reveal
+                    if isAnswerRevealed, let explanation = question.explanation, !explanation.isEmpty {
+                        HStack(alignment: .top, spacing: 12) {
+                            Image(systemName: "lightbulb.fill")
+                                .foregroundColor(.yellow)
+                                .font(.title3)
+
+                            Text(explanation)
+                                .font(.subheadline)
+                                .foregroundColor(.primary)
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color.yellow.opacity(0.1))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.yellow.opacity(0.3), lineWidth: 1)
+                        )
+                        .padding(.horizontal)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
 
                     Spacer(minLength: 100)
                 }
@@ -450,6 +484,72 @@ struct StatItem: View {
             Text(title)
                 .font(.caption)
                 .foregroundColor(.secondary)
+        }
+    }
+}
+
+// MARK: - Quiz Intro View
+struct QuizIntroView: View {
+    let poiName: String
+    let description: String?
+    let questionCount: Int
+    let onStart: () -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                Spacer(minLength: 20)
+
+                // Icon
+                ZStack {
+                    Circle()
+                        .fill(Color.blue.opacity(0.15))
+                        .frame(width: 100, height: 100)
+
+                    Image(systemName: "questionmark.bubble.fill")
+                        .font(.system(size: 44))
+                        .foregroundColor(.blue)
+                }
+
+                // Title
+                Text(poiName)
+                    .font(.title)
+                    .fontWeight(.bold)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+
+                // Description
+                if let description = description, !description.isEmpty {
+                    Text(description)
+                        .font(.body)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
+
+                // Quiz info
+                HStack(spacing: 24) {
+                    Label("\(questionCount) Fragen", systemImage: "list.number")
+                    Label("Multiple Choice", systemImage: "checkmark.circle")
+                }
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+                Spacer(minLength: 40)
+
+                // Start button
+                Button(action: onStart) {
+                    Text("Quiz starten")
+                        .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(Color.blue)
+                        .foregroundColor(.white)
+                        .cornerRadius(12)
+                }
+                .padding(.horizontal)
+                .padding(.bottom)
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ interface QuizQuestion {
 
 interface QuizResponse {
   questions: QuizQuestion[];
+  description?: string;
 }
 
 // Perplexity response format
@@ -67,7 +68,7 @@ Deno.serve(async (req) => {
       // Check if quiz already exists in POI record
       const { data: poi, error: poiError } = await supabase
         .from("pois")
-        .select("id, name, category, description, city, quiz_questions")
+        .select("id, name, category, description, city, formatted_address, quiz_questions, ai_description, quiz_description")
         .eq("id", poiId)
         .single();
 
@@ -83,13 +84,13 @@ Deno.serve(async (req) => {
       if (poi.quiz_questions) {
         console.log(`Cache hit for POI ID: ${poiId}`);
         return new Response(
-          JSON.stringify({ questions: poi.quiz_questions }),
+          JSON.stringify({ questions: poi.quiz_questions, description: poi.quiz_description || poi.ai_description || null }),
           { headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
       // Generate new quiz with Perplexity
-      const result = await generateQuizWithPerplexity(poi.name, poi.category, poi.description, poi.city);
+      const result = await generateQuizWithPerplexity(poi.name, poi.category, poi.description, poi.city, poi.formatted_address);
 
       // Save to POI record including AI-enriched fields
       const now = new Date().toISOString();
@@ -105,6 +106,7 @@ Deno.serve(async (req) => {
       }
       if (result.aiDescription) {
         updateData.ai_description = result.aiDescription;
+        updateData.quiz_description = result.aiDescription;
       }
 
       const { error: updateError } = await supabase
@@ -119,7 +121,7 @@ Deno.serve(async (req) => {
       }
 
       return new Response(
-        JSON.stringify({ questions: result.questions }),
+        JSON.stringify({ questions: result.questions, description: result.aiDescription || null }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -185,6 +187,7 @@ Deno.serve(async (req) => {
       }
       if (result.aiDescription) {
         updateData.ai_description = result.aiDescription;
+        updateData.quiz_description = result.aiDescription;
       }
 
       const { error: poiUpdateError } = await supabase
@@ -217,7 +220,8 @@ async function generateQuizWithPerplexity(
   poiName: string,
   category?: string,
   description?: string,
-  city?: string
+  city?: string,
+  formattedAddress?: string
 ): Promise<EnrichedQuizResult> {
   const perplexityApiKey = Deno.env.get("PERPLEXITY_API_KEY");
   if (!perplexityApiKey) {
@@ -226,9 +230,10 @@ async function generateQuizWithPerplexity(
 
   const categoryText = category ? ` (Kategorie: ${category})` : "";
   const locationContext = city ? ` in ${city}` : "";
+  const addressContext = formattedAddress ? ` (Adresse: ${formattedAddress})` : "";
   const descriptionContext = description ? `\nBekannte Beschreibung: ${description}` : "";
 
-  const prompt = `Recherchiere die Sehenswürdigkeit "${poiName}"${locationContext}${categoryText}.${descriptionContext}
+  const prompt = `Recherchiere die Sehenswürdigkeit "${poiName}"${locationContext}${addressContext}${categoryText}.${descriptionContext}
 
 Erstelle eine ausführliche Antwort mit folgenden Informationen:
 1. Eine detaillierte Beschreibung der Sehenswürdigkeit (mindestens 2-3 Sätze)
@@ -246,7 +251,7 @@ Antworte NUR mit validem JSON in exakt diesem Format:
       "frage": "Interessante Frage über die Sehenswürdigkeit?",
       "antworten": ["Antwort A", "Antwort B", "Antwort C", "Antwort D"],
       "korrekte_antwort": 1,
-      "erklaerung": "Kurze Erklärung warum diese Antwort korrekt ist"
+      "erklaerung": "Ausführliche Erklärung (2-3 Sätze) mit interessanten Hintergrundinformationen, warum diese Antwort korrekt ist"
     }
   ]
 }
@@ -258,9 +263,12 @@ Regeln:
 - korrekte_antwort ist 1-4 (1=erste Antwort, 2=zweite, etc.)
 - Alle Texte auf Deutsch
 - Die Fragen sollen interessante, lehrreiche Fakten abfragen
+- Jede Frage MUSS eine "erklaerung" haben (2-3 Sätze), die ausführlich erklärt warum die richtige Antwort korrekt ist und interessante Zusatzfakten liefert
+- Die Beschreibung soll neugierig machen und Lust auf das Quiz wecken, aber KEINE Antworten auf die Quiz-Fragen vorwegnehmen
 - Gib NUR das JSON zurück, keine Erklärungen oder Markdown`;
 
   console.log(`Generating quiz with Perplexity for POI: ${poiName}`);
+  console.log(`Full prompt:\n${prompt}`);
 
   const response = await fetch("https://api.perplexity.ai/chat/completions", {
     method: "POST",

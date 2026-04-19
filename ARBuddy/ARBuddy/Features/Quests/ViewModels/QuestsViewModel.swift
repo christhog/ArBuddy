@@ -9,6 +9,15 @@ import Foundation
 import CoreLocation
 import Combine
 
+// MARK: - Quest Category Filter
+
+enum QuestCategoryFilter: String, CaseIterable {
+    case poi = "POI-Quests"
+    case world = "World-Quests"
+
+    var displayName: String { rawValue }
+}
+
 // MARK: - POI Quest Group
 
 struct POIQuestGroup: Identifiable {
@@ -25,15 +34,46 @@ class QuestsViewModel: ObservableObject {
     @Published var quests: [Quest] = []
     @Published var filteredQuests: [Quest] = []
     @Published var selectedFilter: QuestType?
+    @Published var selectedStatusFilter: QuestStatusFilter = .open
+    @Published var selectedCategoryFilter: QuestCategoryFilter = .poi
     @Published var isLoading = false
     @Published var completionMessage: String?
     @Published var earnedXP: Int = 0
     @Published var poiProgress: [UUID: POIProgress] = [:]
 
     private let questService = QuestService.shared
+    private var cancellables = Set<AnyCancellable>()
 
     init() {
+        setupQuestServiceBinding()
         updateQuests()
+    }
+
+    /// Sets up Combine bindings to observe QuestService changes
+    private func setupQuestServiceBinding() {
+        // Observe allQuests changes from QuestService
+        questService.$allQuests
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateQuests()
+            }
+            .store(in: &cancellables)
+
+        // Observe poiQuests changes for category filtering
+        questService.$poiQuests
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateQuests()
+            }
+            .store(in: &cancellables)
+
+        // Observe worldQuests changes
+        questService.$worldQuests
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateQuests()
+            }
+            .store(in: &cancellables)
     }
 
     /// Quests grouped by POI
@@ -63,35 +103,119 @@ class QuestsViewModel: ObservableObject {
 
     /// Aktualisiert die Quest-Liste
     func updateQuests() {
-        quests = questService.activeQuests
+        quests = questService.allQuests
         applyFilter()
     }
 
     /// Aktualisiert den POI-Fortschritt aus den Kartendaten
     func updatePOIProgress(_ progress: [UUID: POIProgress]) {
         self.poiProgress = progress
+        applyFilter()
     }
 
-    /// Setzt den Filter
+    /// Setzt den Typ-Filter
     func setFilter(_ filter: QuestType?) {
         selectedFilter = filter
         applyFilter()
     }
 
+    /// Setzt den Status-Filter
+    func setStatusFilter(_ filter: QuestStatusFilter) {
+        selectedStatusFilter = filter
+        applyFilter()
+    }
+
+    /// Setzt den Kategorie-Filter (POI/World)
+    func setCategoryFilter(_ filter: QuestCategoryFilter) {
+        selectedCategoryFilter = filter
+        // Reset type filter when switching to World (type filters not shown there)
+        if filter == .world {
+            selectedFilter = nil
+        }
+        applyFilter()
+    }
+
     /// Wendet den aktuellen Filter an
     private func applyFilter() {
-        if let filter = selectedFilter {
-            filteredQuests = quests.filter { $0.type == filter }
-        } else {
-            filteredQuests = quests
+        var result = quests
+
+        // Category filter (POI/World)
+        switch selectedCategoryFilter {
+        case .poi:
+            // POI quests: have a poiId AND are not AR type
+            result = result.filter { $0.poiId != nil && $0.type != .ar }
+        case .world:
+            // World quests: AR type (regardless of poiId) or no poiId
+            result = result.filter { $0.type == .ar || $0.poiId == nil }
         }
+
+        // Type filter
+        if let filter = selectedFilter {
+            result = result.filter { $0.type == filter }
+        }
+
+        // Status filter
+        switch selectedStatusFilter {
+        case .all:
+            break
+        case .open:
+            result = result.filter { quest in
+                !isQuestCompleted(quest)
+            }
+        case .completed:
+            result = result.filter { quest in
+                isQuestCompleted(quest)
+            }
+        }
+
+        filteredQuests = result
+    }
+
+    /// Prüft ob ein Quest abgeschlossen ist
+    func isQuestCompleted(_ quest: Quest) -> Bool {
+        // Check by quest ID in completedQuestIds
+        if questService.completedQuestIds.contains(quest.id) {
+            return true
+        }
+
+        // Check by POI progress
+        if let poiId = quest.poiId, let progress = poiProgress[poiId] {
+            switch quest.type {
+            case .visit: return progress.visitCompleted
+            case .photo: return progress.photoCompleted
+            case .ar: return progress.arCompleted
+            case .quiz, .trivia: return progress.quizCompleted
+            }
+        }
+
+        return false
     }
 
     /// Sortiert Quests nach Entfernung
     func sortByDistance(from location: CLLocation) {
-        filteredQuests = questService.nearbyQuests(from: location, limit: 50)
+        // Use legacy quests filtered by distance
+        guard let questLocation = quests.first?.location else {
+            applyFilter()
+            return
+        }
+
+        // Sort quests by distance
+        filteredQuests = quests.sorted { quest1, quest2 in
+            guard let loc1 = quest1.location, let loc2 = quest2.location else { return false }
+            let dist1 = location.distance(from: CLLocation(latitude: loc1.latitude, longitude: loc1.longitude))
+            let dist2 = location.distance(from: CLLocation(latitude: loc2.latitude, longitude: loc2.longitude))
+            return dist1 < dist2
+        }
+
         if let filter = selectedFilter {
             filteredQuests = filteredQuests.filter { $0.type == filter }
+        }
+        switch selectedStatusFilter {
+        case .all: break
+        case .open:
+            filteredQuests = filteredQuests.filter { !isQuestCompleted($0) }
+        case .completed:
+            filteredQuests = filteredQuests.filter { isQuestCompleted($0) }
         }
     }
 

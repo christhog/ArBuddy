@@ -6,16 +6,18 @@ struct QuizQuestion: Identifiable, Codable, Equatable, Sendable {
     let question: String
     let answers: [String]
     let correctAnswerIndex: Int
+    let explanation: String?
 
     enum CodingKeys: String, CodingKey {
-        case question, answers, correctAnswerIndex
+        case question, answers, correctAnswerIndex, explanation
     }
 
-    nonisolated init(id: UUID = UUID(), question: String, answers: [String], correctAnswerIndex: Int) {
+    nonisolated init(id: UUID = UUID(), question: String, answers: [String], correctAnswerIndex: Int, explanation: String? = nil) {
         self.id = id
         self.question = question
         self.answers = answers
         self.correctAnswerIndex = correctAnswerIndex
+        self.explanation = explanation
     }
 
     nonisolated init(from decoder: Decoder) throws {
@@ -24,6 +26,7 @@ struct QuizQuestion: Identifiable, Codable, Equatable, Sendable {
         self.question = try container.decode(String.self, forKey: .question)
         self.answers = try container.decode([String].self, forKey: .answers)
         self.correctAnswerIndex = try container.decode(Int.self, forKey: .correctAnswerIndex)
+        self.explanation = try container.decodeIfPresent(String.self, forKey: .explanation)
     }
 
     nonisolated func encode(to encoder: Encoder) throws {
@@ -31,6 +34,7 @@ struct QuizQuestion: Identifiable, Codable, Equatable, Sendable {
         try container.encode(question, forKey: .question)
         try container.encode(answers, forKey: .answers)
         try container.encode(correctAnswerIndex, forKey: .correctAnswerIndex)
+        try container.encodeIfPresent(explanation, forKey: .explanation)
     }
 
     var correctAnswer: String {
@@ -46,11 +50,33 @@ struct QuizQuestion: Identifiable, Codable, Equatable, Sendable {
 }
 
 // MARK: - Quiz
-struct Quiz: Codable {
+struct Quiz: Codable, Sendable {
     let questions: [QuizQuestion]
+    let description: String?
+
+    enum CodingKeys: String, CodingKey {
+        case questions, description
+    }
 
     var questionCount: Int {
         questions.count
+    }
+
+    nonisolated init(questions: [QuizQuestion], description: String? = nil) {
+        self.questions = questions
+        self.description = description
+    }
+
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.questions = try container.decode([QuizQuestion].self, forKey: .questions)
+        self.description = try container.decodeIfPresent(String.self, forKey: .description)
+    }
+
+    nonisolated func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(questions, forKey: .questions)
+        try container.encodeIfPresent(description, forKey: .description)
     }
 }
 
