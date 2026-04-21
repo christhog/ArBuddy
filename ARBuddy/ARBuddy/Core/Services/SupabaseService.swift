@@ -16,11 +16,13 @@ struct AppUser: Identifiable, Codable, Equatable {
     var level: Int
     var createdAt: Date
     var selectedBuddyId: UUID?
+    var skinTintHex: String?
 
     enum CodingKeys: String, CodingKey {
         case id, email, username, xp, level
         case createdAt = "created_at"
         case selectedBuddyId = "selected_buddy_id"
+        case skinTintHex = "skin_tint_hex"
     }
 
     // Computed properties for XP progress
@@ -322,6 +324,7 @@ class SupabaseService: ObservableObject {
                 .value
 
             currentUser = user
+            mirrorSkinTintFromServer(user.skinTintHex)
         } catch {
             print("Failed to load user profile: \(error)")
             // User profile might not exist yet (trigger should create it)
@@ -342,8 +345,45 @@ class SupabaseService: ObservableObject {
                 .value
 
             currentUser = user
+            mirrorSkinTintFromServer(user.skinTintHex)
         } catch {
             print("Retry failed to load user profile: \(error)")
+        }
+    }
+
+    // MARK: - Skin Tint Sync
+
+    /// Mirrors the server skin-tint value into local `UserDefaults` so that
+    /// `BuddyTintService` picks it up when the buddy model loads. Only Micoo
+    /// has tintable skin right now, so this maps 1:1 to Micoo's tint key.
+    private func mirrorSkinTintFromServer(_ hex: String?) {
+        let key = "buddy_tint_Micoo"
+        if let hex, !hex.isEmpty {
+            UserDefaults.standard.set(hex, forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
+    /// Persists the user's skin tint choice to the server. Local state is
+    /// still the source of truth during a session — this just propagates
+    /// the change for cross-device sync.
+    func updateSkinTint(hex: String?) async throws {
+        guard let userId = currentUser?.id else { return }
+
+        struct SkinTintUpdate: Encodable {
+            let skin_tint_hex: String?
+        }
+
+        try await client
+            .from("users")
+            .update(SkinTintUpdate(skin_tint_hex: hex))
+            .eq("id", value: userId.uuidString)
+            .execute()
+
+        if var user = currentUser {
+            user.skinTintHex = hex
+            currentUser = user
         }
     }
 

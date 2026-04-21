@@ -41,6 +41,12 @@ struct SettingsView: View {
                 }
             }
 
+            if let buddy = supabaseService.selectedBuddy {
+                Section("Buddy-Aussehen") {
+                    SkinTintRow(buddyName: buddy.name)
+                }
+            }
+
             Section("Statistiken") {
                 LabeledContent("Level", value: "\(supabaseService.currentUser?.level ?? 1)")
                 LabeledContent("Gesamt XP", value: "\(supabaseService.currentUser?.xp ?? 0)")
@@ -495,5 +501,73 @@ class CloudSettingsViewModel: ObservableObject {
     NavigationStack {
         SettingsView()
             .environmentObject(SupabaseService.shared)
+    }
+}
+
+// MARK: - Skin Tint
+
+/// ColorPicker + preset swatches for the buddy's skin tint. Writes through
+/// to BuddyTintService on every change so the preview refreshes live.
+private struct SkinTintRow: View {
+    let buddyName: String
+    @State private var tint: Color
+    @State private var hasTint: Bool
+
+    // A palette from porcelain → very dark. Roughly aligned with Fitzpatrick
+    // types I–VI so users have a sensible starting point.
+    private let presets: [Color] = [
+        Color(red: 1.00, green: 0.94, blue: 0.88),  // porcelain
+        Color(red: 0.98, green: 0.87, blue: 0.76),  // light
+        Color(red: 0.92, green: 0.78, blue: 0.62),  // fair
+        Color(red: 0.80, green: 0.62, blue: 0.47),  // medium
+        Color(red: 0.62, green: 0.45, blue: 0.32),  // tan
+        Color(red: 0.45, green: 0.30, blue: 0.22),  // brown
+        Color(red: 0.30, green: 0.20, blue: 0.15),  // dark
+        Color(red: 0.18, green: 0.12, blue: 0.09)   // very dark
+    ]
+
+    init(buddyName: String) {
+        self.buddyName = buddyName
+        let saved = BuddyTintService.shared.loadPersistedTint(for: buddyName)
+        _tint = State(initialValue: saved.map { Color($0) } ?? .white)
+        _hasTint = State(initialValue: saved != nil)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ColorPicker("Hautton", selection: $tint, supportsOpacity: false)
+                .onChange(of: tint) { _, newValue in
+                    let ui = UIColor(newValue)
+                    BuddyTintService.shared.savePersistedTint(ui, for: buddyName)
+                    BuddyTintService.shared.reapplyPersisted()
+                    hasTint = true
+                    Task { try? await SupabaseService.shared.updateSkinTint(hex: ui.hexString) }
+                }
+
+            HStack(spacing: 8) {
+                ForEach(Array(presets.enumerated()), id: \.offset) { _, preset in
+                    Circle()
+                        .fill(preset)
+                        .frame(width: 28, height: 28)
+                        .overlay(
+                            Circle().stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                        )
+                        .onTapGesture { tint = preset }
+                }
+            }
+
+            if hasTint {
+                Button("Original wiederherstellen") {
+                    BuddyTintService.shared.savePersistedTint(nil, for: buddyName)
+                    BuddyTintService.shared.reapplyPersisted()
+                    tint = .white
+                    hasTint = false
+                    Task { try? await SupabaseService.shared.updateSkinTint(hex: nil) }
+                }
+                .font(.footnote)
+                .foregroundStyle(.blue)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
