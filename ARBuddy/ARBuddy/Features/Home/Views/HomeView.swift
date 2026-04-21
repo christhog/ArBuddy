@@ -62,6 +62,20 @@ struct HomeView: View {
                         showFullChat: $showFullChat
                     )
                 }
+
+                #if DEBUG
+                // Emotion + mocap debug overlays — triggers facial
+                // expressions / switches the active mocap clip. Release
+                // builds strip the whole stack.
+                VStack(spacing: 4) {
+                    EmotionDebugBar()
+                        .padding(.horizontal, 8)
+                        .padding(.top, 4)
+                    MocapDebugBar()
+                        .padding(.horizontal, 8)
+                    Spacer()
+                }
+                #endif
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -102,3 +116,78 @@ struct HomeView: View {
     HomeView()
         .environmentObject(SupabaseService.shared)
 }
+
+#if DEBUG
+/// Horizontal scroll of small buttons that fire each emotion/expression on the
+/// active buddy. Purely a dev affordance — hidden in release builds.
+private struct EmotionDebugBar: View {
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                chip("😀",  { FacialExpressionService.shared.setExpression(.happy) })
+                chip("😂",  { FacialExpressionService.shared.setExpression(.laughter) })
+                chip("😢",  { FacialExpressionService.shared.setExpression(.sad) })
+                chip("😔",  { FacialExpressionService.shared.setExpression(.melancholy) })
+                chip("😠",  { FacialExpressionService.shared.setExpression(.angry) })
+                chip("😲",  { FacialExpressionService.shared.setExpression(.surprised) })
+                chip("😱",  { FacialExpressionService.shared.setExpression(.fear) })
+                chip("🤢",  { FacialExpressionService.shared.setExpression(.disgust) })
+                chip("🤔",  { FacialExpressionService.shared.setExpression(.thinking) })
+                chip("🤨",  { FacialExpressionService.shared.setExpression(.skeptical) })
+                chip("😯",  { FacialExpressionService.shared.setExpression(.wonder) })
+                chip("Brow L", { FacialExpressionService.shared.raiseEyebrow(.left) })
+                chip("Brow R", { FacialExpressionService.shared.raiseEyebrow(.right) })
+                chip("Brow ↑↑", { FacialExpressionService.shared.raiseEyebrow(.both) })
+                chip("Eye Roll", { FacialExpressionService.shared.eyeRoll() })
+            }
+            .padding(.horizontal, 4)
+        }
+    }
+
+    @ViewBuilder
+    private func chip(_ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.ultraThinMaterial, in: Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Debug-only mocap clip switcher. Renders one chip per available
+/// `MocapClip` and calls `BuddyMocapService.shared.switchClip(_:)` so
+/// we can compare takes live without rebuilding. Hidden in release.
+private struct MocapDebugBar: View {
+    @State private var selected: MocapClip = .default
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("Idle")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            ForEach(MocapClip.allCases, id: \.self) { clip in
+                Button {
+                    selected = clip
+                    BuddyMocapService.shared.switchClip(clip)
+                } label: {
+                    Text(clip.displayName)
+                        .font(.caption)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            selected == clip
+                                ? AnyShapeStyle(Color.accentColor.opacity(0.25))
+                                : AnyShapeStyle(.ultraThinMaterial),
+                            in: Capsule()
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+    }
+}
+#endif

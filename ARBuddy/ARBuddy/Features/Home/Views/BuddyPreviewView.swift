@@ -30,6 +30,10 @@ struct BuddyPreviewView: UIViewRepresentable {
         let cameraNode = SCNNode()
         cameraNode.camera = SCNCamera()
         cameraNode.camera?.fieldOfView = 50
+        // Default zNear is 1.0 m — too far for sub-meter models. Anything
+        // closer is clipped out and the view goes white.
+        cameraNode.camera?.zNear = 0.05
+        cameraNode.camera?.zFar = 100
         cameraNode.name = "camera"
         scene.rootNode.addChildNode(cameraNode)
         context.coordinator.cameraNode = cameraNode
@@ -193,30 +197,37 @@ struct BuddyPreviewView: UIViewRepresentable {
             }
             checkForCamera(modelScene.rootNode)
 
-            // Add nodes from model scene, filtering out cameras/lights at any level
+            // Move nodes from model scene — direct move (not clone) preserves
+            // SCNSkinner.skeleton references; cloning leaves them pointing at
+            // nodes in the now-released modelScene, breaking GPU skinning.
             func addFilteredChildren(from source: SCNNode, to target: SCNNode) {
-                for child in source.childNodes {
+                let children = source.childNodes  // snapshot before mutation
+                for child in children {
                     let name = child.name?.lowercased() ?? ""
-
-                    // Skip embedded cameras, lights, and environment nodes
                     if name.contains("camera") ||
                        name.contains("light") ||
                        name.contains("env_") ||
                        name == "_materials" {
                         continue
                     }
-
-                    let cloned = child.clone()
-                    // Recursively filter children of this node too
-                    cloned.childNodes.filter { node in
-                        let n = node.name?.lowercased() ?? ""
-                        return n.contains("camera") || n.contains("light") || n.contains("env_")
-                    }.forEach { $0.removeFromParentNode() }
-
-                    target.addChildNode(cloned)
+                    child.removeFromParentNode()
+                    child.childNodes
+                        .filter { n in
+                            let s = n.name?.lowercased() ?? ""
+                            return s.contains("camera") || s.contains("light") || s.contains("env_")
+                        }
+                        .forEach { $0.removeFromParentNode() }
+                    target.addChildNode(child)
                 }
             }
             addFilteredChildren(from: modelScene.rootNode, to: buddyNode)
+
+            // DAZ Genesis9 exports have 52 ARKit blend shapes. Combined with
+            // 144-bone skinning this exceeds Metal's ~22 available vertex-buffer
+            // slots for morph data, causing a fatal shader compilation error that
+            // makes the body mesh invisible. Trim to the shapes needed for
+            // lip-sync and expressions.
+            reduceMorphTargets(for: buddyNode)
 
             // Apply scale from buddy config
             let scale = buddy.scale
@@ -233,51 +244,87 @@ struct BuddyPreviewView: UIViewRepresentable {
             scene.rootNode.addChildNode(buddyNode)
             context.coordinator.buddyNode = buddyNode
 
-            // Wait one run-loop so SceneKit initialises geometry, then position
-            // the node and camera based on the now-correct bounding box.
+            #if DEBUG
+            scnView.debugOptions = []
+            #endif
+
+            // Wait for SceneKit to initialise geometry, then position the node
+            // and camera based on the bounding box. USDZ geometry is lazy-loaded,
+            // so complex models (e.g. Genesis 9 with 6 mesh objects + skinning)
+            // may need several frames before the bounding box is valid.
+            // We retry up to 4 times with increasing delays until the computed
+            // visual height looks plausible (> 0.3 m at world scale).
             let cameraNode = context.coordinator.cameraNode
             let coordinator = context.coordinator
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                let (minBound, maxBound) = buddyNode.boundingBox
-                let localHeight = (maxBound.y - minBound.y) * scale
-                let localDepth  = (maxBound.z - minBound.z) * scale
-                let width       = (maxBound.x - minBound.x) * scale
+            let retryDelays: [Double] = [0.1, 0.3, 0.5, 1.0]
 
-                let visualHeight: Float
-                let groundOffset: Float
+            func positionCamera(attemptIndex: Int) {
+                let delay = retryDelays[min(attemptIndex, retryDelays.count - 1)]
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    let (minBound, maxBound) = buddyNode.boundingBox
+                    let yExtent = (maxBound.y - minBound.y) * scale
+                    let zExtent = (maxBound.z - minBound.z) * scale
 
-                if hasEmbeddedCamera {
-                    visualHeight = localDepth
-                    groundOffset = -minBound.z * scale
-                } else {
-                    visualHeight = localHeight
-                    groundOffset = -minBound.y * scale
+                    // Determine which axis holds the model's visual height.
+                    // Micoo: embedded camera → height always in Z.
+                    // Blender Z-up exports: SceneKit doesn't apply the root's
+                    // xformOp:rotateXYZ(-90,0,0), so height is still in Z
+                    // (zExtent >> yExtent). Apply -90° X to buddyNode to stand
+                    // the model upright, then use Z for camera math.
+                    let visualHeight: Float
+                    let groundOffset: Float
+
+                    if hasEmbeddedCamera {
+                        visualHeight = zExtent
+                        groundOffset = -minBound.z * scale
+                    } else if zExtent > yExtent * 3.0 {
+                        // Blender Z-up: apply rotation once then use Z
+                        if abs(buddyNode.eulerAngles.x) < 0.1 {
+                            buddyNode.eulerAngles.x = -.pi / 2
+                            print("[BuddyPreview] Applied -90° X for Blender Z-up model: \(buddy.name)")
+                        }
+                        visualHeight = zExtent
+                        groundOffset = -minBound.z * scale
+                    } else {
+                        visualHeight = yExtent
+                        groundOffset = -minBound.y * scale
+                    }
+
+                    // Retry if the bounding box hasn't been populated yet.
+                    let nextAttempt = attemptIndex + 1
+                    if visualHeight < 0.3 && nextAttempt < retryDelays.count {
+                        print("[BuddyPreview] visH too small (\(visualHeight)), retrying (attempt \(nextAttempt))…")
+                        positionCamera(attemptIndex: nextAttempt)
+                        return
+                    }
+
+                    buddyNode.position = SCNVector3(0, groundOffset, 0)
+                    coordinator.saveOriginalTransform(buddyNode)
+
+                    let faceY      = visualHeight * 0.85
+                    let fovRadians = Float(50 * Double.pi / 180)
+                    // Frame based on height only — T-pose arm span inflates width
+                    // and would push the camera too far back.
+                    let frameDim   = visualHeight * 0.38
+                    let distance   = (frameDim / 2) / tan(fovRadians / 2)
+
+                    let camY   = faceY * 1.15
+                    let lookAt = faceY * 0.88
+                    cameraNode?.position = SCNVector3(0, camY, distance)
+                    cameraNode?.look(at: SCNVector3(0, lookAt, 0))
+
+                    // Now that the real world-space height is known, scale
+                    // idle amplitudes accordingly and (re)start the idle
+                    // layers so they don't use the default Micoo-sized
+                    // translations on smaller buddies like Aleda.
+                    BuddyGestureService.shared.updateWorldHeight(CGFloat(visualHeight))
+                    BuddyGestureService.shared.startIdle()
+
+                    print("[BuddyPreview] camY=\(camY) faceY=\(faceY) dist=\(distance) visH=\(visualHeight) attempt=\(attemptIndex)")
                 }
-
-                // Place feet at y = 0
-                buddyNode.position = SCNVector3(0, groundOffset, 0)
-                coordinator.saveOriginalTransform(buddyNode)
-
-                // Camera aimed at face (~85% of model height).
-                // Camera is placed lower than the look-at point so it tilts
-                // upward — this pushes the face into the upper portion of the
-                // screen, clear of the chat overlay at the bottom.
-                let faceY      = visualHeight * 0.85
-                let fovRadians = Float(50 * Double.pi / 180)
-                let frameDim   = max(width, visualHeight * 0.48)
-                let distance   = (frameDim / 2) / tan(fovRadians / 2) * 1.3
-
-                // Camera ABOVE face, looking down toward midsection.
-                // Because the look-at point is below the face, the face
-                // appears in the upper third of the frame — well above the
-                // chat overlay that covers the bottom ~45 % of the screen.
-                let camY   = faceY * 1.15   // 15 % above face
-                let lookAt = faceY * 0.82   // look toward upper chest
-                cameraNode?.position = SCNVector3(0, camY, distance)
-                cameraNode?.look(at: SCNVector3(0, lookAt, 0))
-
-                print("[BuddyPreview] camY=\(camY) faceY=\(faceY) dist=\(distance) visH=\(visualHeight)")
             }
+
+            positionCamera(attemptIndex: 0)
 
             // Play animations
             playAnimations(for: buddyNode)
@@ -285,10 +332,85 @@ struct BuddyPreviewView: UIViewRepresentable {
             // Configure SceneKit lip sync service
             SceneKitLipSyncService.shared.configure(buddyNode: buddyNode)
 
+            // Configure facial expression layer (eye blinks, brow raises, emotions)
+            FacialExpressionService.shared.configure(buddyNode: buddyNode)
+            FacialExpressionService.shared.startIdleBehaviors()
+
+            // Apply persisted skin tint (if any). Registers this node as the
+            // active target so the Settings picker can live-refresh.
+            BuddyTintService.shared.apply(
+                tint: BuddyTintService.shared.loadPersistedTint(for: buddy.name),
+                to: buddyNode,
+                buddyId: buddy.name
+            )
+
+            // Procedural idle (breathing + micro-sway) and gesture dispatch.
+            // Idle itself is started from inside positionCamera's callback
+            // once the real world-space height is known, so the amplitudes
+            // are scaled to the actual buddy size.
+            BuddyGestureService.shared.configure(buddyNode: buddyNode)
+
+            // Try the Mixamo-retargeted mocap idle. If a clip attaches,
+            // flag the gesture service so its procedural body-idle layers
+            // don't fight the mocap channels. Hair-strand idle, ambient
+            // fidgets, blendshape-based face + lip-sync keep running.
+            let mocapAttached = BuddyMocapService.shared.play(.default, on: buddyNode, loop: true)
+            BuddyGestureService.shared.isMocapDriven = mocapAttached
+
             print("Loaded buddy in SceneKit: \(buddy.name)")
 
         } catch {
             print("Failed to load USDZ in SceneKit: \(error)")
+        }
+    }
+
+    /// Reduces morph targets on nodes that have both skeletal skinning and morphing.
+    /// Priority list covers all shapes used by SceneKitLipSyncService and
+    /// FacialExpressionService, capped at 20 to stay within Metal's vertex-buffer budget.
+    private func reduceMorphTargets(for node: SCNNode) {
+        let priority: [String] = [
+            "jawOpen", "mouthClose", "eyeBlinkLeft", "eyeBlinkRight",
+            "browDownLeft", "browDownRight", "browInnerUp",
+            "mouthSmileLeft", "mouthSmileRight", "mouthFrownLeft", "mouthFrownRight",
+            "mouthFunnel", "mouthPucker", "mouthRollLower", "mouthRollUpper",
+            "cheekPuff", "eyeSquintLeft", "eyeSquintRight",
+            "browOuterUpLeft", "browOuterUpRight"
+        ]
+
+        node.enumerateChildNodes { child, _ in
+            guard let morpher = child.morpher else { return }
+
+            // SceneKit's Metal shader generator produces an unrecoverable "Compiler
+            // error while building render pipeline state" whenever a node carries
+            // BOTH an SCNSkinner (GPU calcMode) AND an SCNMorpher. No amount of
+            // morph-target reduction or material simplification prevents the failure —
+            // the shader is generated before any rendering attempt. The only workaround
+            // is to strip the morpher from every skinned node so the body renders via
+            // GPU skinning alone. LipSync falls back to jaw-bone rotation.
+            if child.skinner != nil {
+                child.morpher = nil
+                print("[BuddyPreview] Removed morpher from skinned '\(child.name ?? "?")' (\(morpher.targets.count) targets)")
+                return
+            }
+
+            // Non-skinned nodes: reduce to the priority set to stay within Metal
+            // vertex-buffer limits.
+            guard morpher.targets.count > 20 else { return }
+
+            var kept: [SCNGeometry] = []
+            for name in priority {
+                if let t = morpher.targets.first(where: { $0.name == name }) {
+                    kept.append(t)
+                }
+            }
+            if kept.isEmpty { kept = Array(morpher.targets.prefix(20)) }
+
+            let newMorpher = SCNMorpher()
+            newMorpher.targets = kept
+            newMorpher.unifiesNormals = true
+            child.morpher = newMorpher
+
+            print("[BuddyPreview] Reduced morpher '\(child.name ?? "?")': \(morpher.targets.count)→\(kept.count) targets")
         }
     }
 

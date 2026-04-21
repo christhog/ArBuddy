@@ -211,13 +211,20 @@ struct ARViewContainer: UIViewRepresentable {
                 spawnPosition = position
                 buddyEntity = clone
 
-                // Save idle animation and start playing it
-                idleAnimation = clone.availableAnimations.first
-                if let animation = idleAnimation {
-                    currentAnimationController = clone.playAnimation(animation.repeat())
-                    print("Idle animation started")
+                // Play the Mixamo-retargeted mocap idle. Falls back to
+                // whatever animation shipped inside the buddy USDZ (e.g.
+                // the old bundled walk cycle) if no mocap clip is in the
+                // app bundle for this buddy.
+                if BuddyMocapService.shared.play(.default, on: clone, loop: true) {
+                    print("Mocap idle started")
                 } else {
-                    print("No idle animation found in model")
+                    idleAnimation = clone.availableAnimations.first
+                    if let animation = idleAnimation {
+                        currentAnimationController = clone.playAnimation(animation.repeat())
+                        print("Fallback idle animation started")
+                    } else {
+                        print("No idle animation found in model")
+                    }
                 }
 
                 // Load walking animation, then start walking
