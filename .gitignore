@@ -57,3 +57,10 @@ supabase/.temp
 # Raw DCC source assets (shipped USDZ lives under ARBuddy/)
 Micoo/
 Jona/
+Aleda/
+
+# Reality Composer Pro scratch package
+Untitled/
+
+# USDZ backups / experiment leftovers
+*.usdz.bak
