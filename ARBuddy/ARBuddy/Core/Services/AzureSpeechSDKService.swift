@@ -74,18 +74,35 @@ class AzureSpeechSDKService: ObservableObject {
 
     // MARK: - Public API
 
+    /// One bookmark event surfaced by the SDK during synthesis — used by the
+    /// chat layer to flip facial expressions at exact audio offsets.
+    struct BookmarkEvent {
+        let name: String
+        let audioOffsetMs: Int
+    }
+
     /// Result of a synthesis call: MP3 audio bytes + collected viseme events.
     struct SynthesisResult {
         let audioData: Data
         let visemes: [VisemeEvent]
+        let bookmarks: [BookmarkEvent]
     }
 
     /// Synthesizes `text` to audio + viseme stream using the Azure Speech SDK.
     /// Does NOT play audio — caller hands the bytes to `SynchronizedAudioPlayer`
     /// so the lip-sync layer gets a precise playback start time.
     func synthesize(_ text: String) async throws -> SynthesisResult {
-        guard isEnabled, !text.isEmpty else {
-            return SynthesisResult(audioData: Data(), visemes: [])
+        return try await synthesize(segments: [(text: text, emotion: nil)])
+    }
+
+    /// Segment-aware variant: for each `(text, emotion)` pair, an SSML
+    /// `<bookmark mark="emotion:xxx"/>` is emitted immediately before the
+    /// text. Azure fires `bookmarkReached` at the exact audio offset of that
+    /// point, which the caller uses to drive facial expression changes.
+    func synthesize(segments: [(text: String, emotion: String?)]) async throws -> SynthesisResult {
+        let joined = segments.map { $0.text }.joined()
+        guard isEnabled, !joined.isEmpty else {
+            return SynthesisResult(audioData: Data(), visemes: [], bookmarks: [])
         }
         guard isSDKAvailable() else {
             throw SDKError.sdkNotLinked
@@ -97,7 +114,7 @@ class AzureSpeechSDKService: ObservableObject {
         let (token, region) = try await fetchToken()
 
         #if canImport(MicrosoftCognitiveServicesSpeech)
-        return try await synthesizeWithSDK(text: text, token: token, region: region)
+        return try await synthesizeWithSDK(segments: segments, token: token, region: region)
         #else
         throw SDKError.sdkNotLinked
         #endif
@@ -106,10 +123,10 @@ class AzureSpeechSDKService: ObservableObject {
     // MARK: - SDK Synthesis
 
     #if canImport(MicrosoftCognitiveServicesSpeech)
-    private func synthesizeWithSDK(text: String, token: String, region: String) async throws -> SynthesisResult {
+    private func synthesizeWithSDK(segments: [(text: String, emotion: String?)], token: String, region: String) async throws -> SynthesisResult {
         // Azure SDK calls are synchronous and blocking — run off the main actor.
         let voice = selectedVoice.rawValue
-        let ssml = buildSSML(text: text)
+        let ssml = buildSSML(segments: segments)
 
         return try await Task.detached(priority: .userInitiated) {
             let speechConfig = try SPXSpeechConfiguration(authorizationToken: token, region: region)
@@ -123,6 +140,7 @@ class AzureSpeechSDKService: ObservableObject {
             // Thread-safe viseme collector. The viseme callback fires on an
             // internal SDK thread during synthesis.
             let collector = VisemeCollector()
+            let bookmarkCollector = BookmarkCollector()
 
             synthesizer.addVisemeReceivedEventHandler { _, args in
                 // args.audioOffset is in 100-ns ticks (UInt64).
@@ -131,14 +149,20 @@ class AzureSpeechSDKService: ObservableObject {
                 collector.append(VisemeEvent(visemeId: visemeId, audioOffsetMilliseconds: offsetMs))
             }
 
+            synthesizer.addBookmarkReachedEventHandler { _, args in
+                let offsetMs = Int(args.audioOffset / 10_000)
+                bookmarkCollector.append(BookmarkEvent(name: args.text, audioOffsetMs: offsetMs))
+            }
+
             let result = try synthesizer.speakSsml(ssml)
 
             switch result.reason {
             case .synthesizingAudioCompleted:
                 let audio = result.audioData ?? Data()
                 let visemes = collector.snapshot()
-                print("[AzureSDK] Synthesized \(audio.count) bytes + \(visemes.count) visemes")
-                return SynthesisResult(audioData: audio, visemes: visemes)
+                let bookmarks = bookmarkCollector.snapshot()
+                print("[AzureSDK] Synthesized \(audio.count) bytes + \(visemes.count) visemes + \(bookmarks.count) bookmarks")
+                return SynthesisResult(audioData: audio, visemes: visemes, bookmarks: bookmarks)
             case .canceled:
                 let details = try SPXSpeechSynthesisCancellationDetails(fromCanceledSynthesisResult: result)
                 let reason = details.errorDetails ?? "unknown"
@@ -192,12 +216,21 @@ class AzureSpeechSDKService: ObservableObject {
 
     // MARK: - SSML Builder
 
-    private func buildSSML(text: String) -> String {
+    private func buildSSML(segments: [(text: String, emotion: String?)]) -> String {
         let voice = selectedVoice.rawValue
         let supportsStyle = speechStyle != .none && selectedVoice.supportedStyles.contains(speechStyle)
         let rateIsCustom = speechRate != "0%"
 
-        var body = text
+        // Emit one bookmark per segment directly before the segment's text.
+        // Azure fires bookmarkReached at the audio offset of that exact point.
+        var body = ""
+        for segment in segments {
+            if let emotion = segment.emotion, !emotion.isEmpty {
+                body += "<bookmark mark=\"emotion:\(Self.xmlEscape(emotion))\"/>"
+            }
+            body += Self.xmlEscape(segment.text)
+        }
+
         if supportsStyle {
             body = "<mstts:express-as style=\"\(speechStyle.rawValue)\" styledegree=\"\(styleDegree)\">\(body)</mstts:express-as>"
         }
@@ -213,6 +246,13 @@ class AzureSpeechSDKService: ObservableObject {
           </voice>
         </speak>
         """
+    }
+
+    private static func xmlEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+         .replacingOccurrences(of: "<", with: "&lt;")
+         .replacingOccurrences(of: ">", with: "&gt;")
+         .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
     // MARK: - Settings
@@ -281,6 +321,25 @@ private final class VisemeCollector: @unchecked Sendable {
     }
 
     func snapshot() -> [VisemeEvent] {
+        lock.lock()
+        let copy = events
+        lock.unlock()
+        return copy
+    }
+}
+
+/// Thread-safe accumulator for bookmark events during SDK callback dispatch.
+private final class BookmarkCollector: @unchecked Sendable {
+    private var events: [AzureSpeechSDKService.BookmarkEvent] = []
+    private let lock = NSLock()
+
+    func append(_ event: AzureSpeechSDKService.BookmarkEvent) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    func snapshot() -> [AzureSpeechSDKService.BookmarkEvent] {
         lock.lock()
         let copy = events
         lock.unlock()

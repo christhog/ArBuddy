@@ -248,18 +248,34 @@ class AzureSpeechService: NSObject, ObservableObject {
         isLoading = false
     }
 
+    /// One emotion cue the caller can schedule against audioStartTime.
+    struct EmotionCue {
+        let emotion: String
+        let audioOffsetMs: Int
+    }
+
     /// Result of speakWithLipSync containing visemes and audio start time
     struct LipSyncSpeechResult {
         let visemes: [VisemeEvent]
         let audioStartTime: Date
         let actualAudioDuration: TimeInterval  // Actual duration from AVAudioPlayer
+        let emotionCues: [EmotionCue]
     }
 
-    /// Speaks text with lip sync support
+    /// Speaks text with lip sync support (no emotion segments).
     /// Returns viseme events and audio start time for synchronized lip sync animation
     func speakWithLipSync(_ text: String) async -> LipSyncSpeechResult {
-        guard isEnabled, !text.isEmpty else {
-            return LipSyncSpeechResult(visemes: [], audioStartTime: Date(), actualAudioDuration: 0)
+        await speakWithLipSync(segments: [(text: text, emotion: nil)])
+    }
+
+    /// Segment-aware variant. Each `(text, emotion)` pair becomes an SSML
+    /// bookmark on the SDK path; the fired offsets are returned as
+    /// `emotionCues` so the caller can flip facial expressions in sync with
+    /// the audio.
+    func speakWithLipSync(segments: [(text: String, emotion: String?)]) async -> LipSyncSpeechResult {
+        let joined = segments.map { $0.text }.joined()
+        guard isEnabled, !joined.isEmpty else {
+            return LipSyncSpeechResult(visemes: [], audioStartTime: Date(), actualAudioDuration: 0, emotionCues: [])
         }
 
         // Stop any current playback
@@ -276,14 +292,21 @@ class AzureSpeechService: NSObject, ObservableObject {
             sdkService.styleDegree = styleDegree
 
             do {
-                let result = try await sdkService.synthesize(text)
+                let result = try await sdkService.synthesize(segments: segments)
                 let playbackInfo = try await playAudioAndReturnStartTime(data: result.audioData)
                 isLoading = false
-                print("[AzureSpeech] SDK path: \(result.visemes.count) real visemes, audio \(String(format: "%.2fs", playbackInfo.duration))")
+                let cues = result.bookmarks.compactMap { b -> EmotionCue? in
+                    // Bookmark names are `emotion:<name>` — strip the prefix.
+                    guard b.name.hasPrefix("emotion:") else { return nil }
+                    return EmotionCue(emotion: String(b.name.dropFirst("emotion:".count)),
+                                      audioOffsetMs: b.audioOffsetMs)
+                }
+                print("[AzureSpeech] SDK path: \(result.visemes.count) visemes, \(cues.count) emotion cues, audio \(String(format: "%.2fs", playbackInfo.duration))")
                 return LipSyncSpeechResult(
                     visemes: result.visemes,
                     audioStartTime: playbackInfo.startTime,
-                    actualAudioDuration: playbackInfo.duration
+                    actualAudioDuration: playbackInfo.duration,
+                    emotionCues: cues
                 )
             } catch {
                 print("[AzureSpeech] SDK path failed, falling back to REST: \(error)")
@@ -292,8 +315,10 @@ class AzureSpeechService: NSObject, ObservableObject {
         }
 
         // Use server-side viseme generation (synchronized to actual audio duration)
+        // REST path doesn't support bookmarks — we fall back to segment-A
+        // timing: estimate offset by character progress through `joined`.
         do {
-            let result = try await fetchAudioWithVisemes(for: text)
+            let result = try await fetchAudioWithVisemes(for: joined)
             let playbackInfo = try await playAudioAndReturnStartTime(data: result.audioData)
             isLoading = false
 
@@ -317,29 +342,52 @@ class AzureSpeechService: NSObject, ObservableObject {
                 print("[AzureSpeech] Using \(result.visemes.count) visemes (duration match: est=\(Int(estimatedDurationMs))ms act=\(Int(actualDurationMs))ms)")
             }
 
+            let cues = Self.estimateEmotionCues(segments: segments,
+                                                totalDurationMs: actualDurationMs)
             return LipSyncSpeechResult(
                 visemes: scaledVisemes,
                 audioStartTime: playbackInfo.startTime,
-                actualAudioDuration: playbackInfo.duration
+                actualAudioDuration: playbackInfo.duration,
+                emotionCues: cues
             )
         } catch {
             print("[AzureSpeech] Error fetching with visemes: \(error)")
             // Fallback to simulated visemes
-            let visemes = generateSimulatedVisemes(for: text)
+            let visemes = generateSimulatedVisemes(for: joined)
             var playbackInfo = AudioPlaybackInfo(startTime: Date(), duration: 0)
             do {
-                let audioData = try await fetchAudio(for: text)
+                let audioData = try await fetchAudio(for: joined)
                 playbackInfo = try await playAudioAndReturnStartTime(data: audioData)
             } catch {
                 print("[AzureSpeech] Fallback error: \(error)")
             }
             isLoading = false
+            let cues = Self.estimateEmotionCues(segments: segments,
+                                                totalDurationMs: playbackInfo.duration * 1000)
             return LipSyncSpeechResult(
                 visemes: visemes,
                 audioStartTime: playbackInfo.startTime,
-                actualAudioDuration: playbackInfo.duration
+                actualAudioDuration: playbackInfo.duration,
+                emotionCues: cues
             )
         }
+    }
+
+    /// Cue estimation fallback for the REST path: distributes emotion flips
+    /// proportionally to character counts across the stitched text.
+    private static func estimateEmotionCues(segments: [(text: String, emotion: String?)],
+                                            totalDurationMs: Double) -> [EmotionCue] {
+        let totalChars = max(segments.reduce(0) { $0 + $1.text.count }, 1)
+        var cursorChars = 0
+        var cues: [EmotionCue] = []
+        for segment in segments {
+            if let emotion = segment.emotion, !emotion.isEmpty {
+                let offset = Int(totalDurationMs * Double(cursorChars) / Double(totalChars))
+                cues.append(EmotionCue(emotion: emotion, audioOffsetMs: offset))
+            }
+            cursorChars += segment.text.count
+        }
+        return cues
     }
 
     /// Response structure for audio + visemes

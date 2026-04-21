@@ -12,71 +12,86 @@ import SwiftUI
 struct MiniChatOverlay: View {
     @ObservedObject var viewModel: ChatViewModel
     @Binding var showFullChat: Bool
+    @State private var isCollapsed = false
 
     /// Maximum number of messages to display
     private let maxVisibleMessages = 5
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header with expand button
             headerView
 
-            // Messages area
-            messagesArea
-
-            // Compact input
-            CompactChatInput(viewModel: viewModel)
+            if !isCollapsed {
+                messagesArea
+                CompactChatInput(viewModel: viewModel)
+            }
         }
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 16))
         .shadow(color: .black.opacity(0.15), radius: 10, y: 5)
         .padding(.horizontal, 16)
         .padding(.bottom, 16)
+        .animation(.spring(duration: 0.3), value: isCollapsed)
     }
 
     // MARK: - Header
 
     private var headerView: some View {
         HStack {
+            // Collapse toggle
+            Button {
+                isCollapsed.toggle()
+            } label: {
+                Image(systemName: isCollapsed ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(8)
+                    .background(Circle().fill(Color(.tertiarySystemBackground)))
+            }
+
             // Status indicator
-            if viewModel.isGenerating {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .scaleEffect(0.7)
-                    Text("Denkt nach...")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            if !isCollapsed {
+                if viewModel.isGenerating {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.7)
+                        Text("Denkt nach...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if viewModel.isSpeaking {
+                    HStack(spacing: 6) {
+                        Image(systemName: "speaker.wave.2.fill")
+                            .font(.caption)
+                            .foregroundStyle(.blue)
+                        Text("Spricht...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
-            } else if viewModel.isSpeaking {
-                HStack(spacing: 6) {
-                    Image(systemName: "speaker.wave.2.fill")
-                        .font(.caption)
-                        .foregroundStyle(.blue)
-                    Text("Spricht...")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            } else {
+                // Collapsed: show input inline so the user can still chat
+                CompactChatInput(viewModel: viewModel)
+                    .padding(.vertical, -4)
             }
 
             Spacer()
 
-            // Expand button
-            Button {
-                showFullChat = true
-            } label: {
-                Image(systemName: "arrow.up.left.and.arrow.down.right")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .padding(8)
-                    .background(
-                        Circle()
-                            .fill(Color(.tertiarySystemBackground))
-                    )
+            // Expand to full chat
+            if !isCollapsed {
+                Button {
+                    showFullChat = true
+                } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(8)
+                        .background(Circle().fill(Color(.tertiarySystemBackground)))
+                }
             }
         }
         .padding(.horizontal, 12)
         .padding(.top, 10)
-        .padding(.bottom, 6)
+        .padding(.bottom, isCollapsed ? 10 : 6)
     }
 
     // MARK: - Messages

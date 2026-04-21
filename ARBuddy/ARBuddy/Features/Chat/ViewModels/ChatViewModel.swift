@@ -109,6 +109,8 @@ class ChatViewModel: ObservableObject {
                 // Only update from local TTS if not using cloud
                 if !self.isUsingCloud {
                     self.isSpeaking = state.isSpeaking
+                    // Pause ambient baked-gesture scheduler while talking.
+                    BuddyGestureService.shared.setSpeaking(state.isSpeaking)
                 }
             }
             .store(in: &cancellables)
@@ -121,6 +123,7 @@ class ChatViewModel: ObservableObject {
                 // Only update from Azure TTS if using cloud
                 if self.isUsingCloud {
                     self.isSpeaking = speaking
+                    BuddyGestureService.shared.setSpeaking(speaking)
                 }
             }
             .store(in: &cancellables)
@@ -195,14 +198,14 @@ class ChatViewModel: ObservableObject {
                 conversationHistory: []
             ) {
                 responseText += token
-                assistantMessage.content = responseText.withoutToolCalls
+                assistantMessage.content = responseText.withoutToolCalls.withoutEmotionMarkers.withoutGestureMarkers
 
                 if let index = messages.lastIndex(where: { $0.id == assistantMessage.id }) {
                     messages[index] = assistantMessage
                 }
             }
 
-            assistantMessage.content = responseText.withoutToolCalls
+            assistantMessage.content = responseText.withoutToolCalls.withoutEmotionMarkers.withoutGestureMarkers
             assistantMessage.isStreaming = false
 
             if let index = messages.lastIndex(where: { $0.id == assistantMessage.id }) {
@@ -210,7 +213,7 @@ class ChatViewModel: ObservableObject {
             }
 
             await historyStore.addMessage(assistantMessage)
-            await speakResponse(assistantMessage.content)
+            await speakResponse(responseText.withoutToolCalls)
 
         } catch {
             print("[ChatViewModel] Cloud greeting failed: \(error), falling back to static")
@@ -256,7 +259,7 @@ class ChatViewModel: ObservableObject {
                     }
                 }
 
-                assistantMessage.content = responseText.withoutToolCalls
+                assistantMessage.content = responseText.withoutToolCalls.withoutEmotionMarkers.withoutGestureMarkers
                 assistantMessage.isStreaming = false
 
                 if let index = messages.lastIndex(where: { $0.id == assistantMessage.id }) {
@@ -264,7 +267,7 @@ class ChatViewModel: ObservableObject {
                 }
 
                 await historyStore.addMessage(assistantMessage)
-                await speakResponse(assistantMessage.content)
+                await speakResponse(responseText.withoutToolCalls)
 
             } catch {
                 // Fallback to static greeting on error
@@ -429,7 +432,7 @@ class ChatViewModel: ObservableObject {
                 conversationHistory: Array(messages.dropLast()) // Exclude the placeholder
             ) {
                 responseText += token
-                assistantMessage.content = responseText.withoutToolCalls
+                assistantMessage.content = responseText.withoutToolCalls.withoutEmotionMarkers.withoutGestureMarkers
 
                 // Update the last message
                 if let index = messages.lastIndex(where: { $0.id == assistantMessage.id }) {
@@ -438,7 +441,7 @@ class ChatViewModel: ObservableObject {
             }
 
             // Finalize message
-            assistantMessage.content = responseText.withoutToolCalls
+            assistantMessage.content = responseText.withoutToolCalls.withoutEmotionMarkers.withoutGestureMarkers
             assistantMessage.isStreaming = false
             if let index = messages.lastIndex(where: { $0.id == assistantMessage.id }) {
                 messages[index] = assistantMessage
@@ -448,7 +451,7 @@ class ChatViewModel: ObservableObject {
             await historyStore.addMessage(assistantMessage)
 
             // Speak response with Azure TTS
-            await speakResponse(assistantMessage.content)
+            await speakResponse(responseText.withoutToolCalls)
 
         } catch {
             print("[ChatViewModel] Claude generation failed: \(error)")
@@ -517,7 +520,9 @@ class ChatViewModel: ObservableObject {
                 let processed = await toolCallService.processResponse(responseText)
 
                 // Update message with processed text
-                assistantMessage.content = processed.displayText.isEmpty ? responseText.withoutToolCalls : processed.displayText
+                assistantMessage.content = processed.displayText.isEmpty
+                    ? responseText.withoutToolCalls.withoutEmotionMarkers.withoutGestureMarkers
+                    : processed.displayText.withoutEmotionMarkers.withoutGestureMarkers
                 assistantMessage.toolCalls = processed.toolResults
                 assistantMessage.isStreaming = false
 
@@ -541,7 +546,7 @@ class ChatViewModel: ObservableObject {
             await historyStore.addMessage(assistantMessage)
 
             // Speak response with local TTS
-            await speakResponse(assistantMessage.content)
+            await speakResponse(responseText.withoutToolCalls)
 
         } catch {
             assistantMessage.content = "Entschuldige, es ist ein Fehler aufgetreten: \(error.localizedDescription)"
@@ -584,7 +589,7 @@ class ChatViewModel: ObservableObject {
                 }
             }
 
-            followUpMessage.content = responseText.withoutToolCalls
+            followUpMessage.content = responseText.withoutToolCalls.withoutEmotionMarkers.withoutGestureMarkers
             followUpMessage.isStreaming = false
 
             if let index = messages.lastIndex(where: { $0.id == followUpMessage.id }) {
@@ -592,7 +597,7 @@ class ChatViewModel: ObservableObject {
             }
 
             await historyStore.addMessage(followUpMessage)
-            await speakResponse(followUpMessage.content)
+            await speakResponse(responseText.withoutToolCalls)
 
         } catch {
             print("[Chat] Follow-up generation failed: \(error)")
@@ -604,34 +609,90 @@ class ChatViewModel: ObservableObject {
     /// Speaks a response using the appropriate TTS service based on current mode
     /// Also triggers lip sync animation when available
     private func speakResponse(_ text: String) async {
+        // One body gesture per response — fired on actual audio start below,
+        // not here, so TTS synthesis latency doesn't make the gesture precede
+        // speech.
+        let gestureMarker = text.firstGestureMarker
+
+        // Strip gesture markers before segmenting for emotions so they don't
+        // leak into SSML or viseme generation.
+        let cleanedText = text.withoutGestureMarkers
+
+        // Split the response at `[emotion:xxx]` markers. Each segment becomes
+        // an SSML bookmark on the Azure SDK path — the bookmarkReached events
+        // fire at the exact audio offsets, which we translate into
+        // setExpression calls for frame-accurate sync.
+        let segments = cleanedText.emotionSegments
+
         if isUsingCloud && azureSpeechService.isEnabled {
-            // Use Azure TTS for cloud mode with lip sync
-            // This returns both visemes AND the exact audio start time for synchronization
-            let result = await azureSpeechService.speakWithLipSync(text)
+            let result = await azureSpeechService.speakWithLipSync(segments: segments)
 
             // Start lip sync animation if we have visemes, using the exact audio start time
             if !result.visemes.isEmpty {
-                // RealityKit (AR View)
                 lipSyncService.startAnimation(with: result.visemes, audioStartTime: result.audioStartTime)
-                // SceneKit (Home View / BuddyPreviewView)
                 SceneKitLipSyncService.shared.startAnimation(with: result.visemes, audioStartTime: result.audioStartTime)
             } else {
-                // Fallback to amplitude-based if no visemes
                 lipSyncService.startAmplitudeMode()
                 SceneKitLipSyncService.shared.startAmplitudeMode()
+            }
+
+            scheduleEmotionCues(result.emotionCues, audioStartTime: result.audioStartTime)
+
+            if let marker = gestureMarker {
+                let delay = max(0, result.audioStartTime.timeIntervalSinceNow)
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    BuddyGestureService.shared.play(marker: marker)
+                }
             }
 
             // Observe speaking state to stop lip sync when done
             observeAzureSpeakingState()
         } else if ttsService.isEnabled {
-            // Use local AVSpeech for offline mode
-            // Start amplitude-based lip sync for both renderers
+            // Local TTS doesn't expose word/time callbacks — fall back to the
+            // first segment's emotion for the whole utterance. Still better
+            // than nothing until we ship a local bookmark equivalent.
+            if let first = segments.first(where: { $0.emotion != nil })?.emotion,
+               let exp = FacialExpressionService.Expression.fromMarker(first) {
+                FacialExpressionService.shared.setExpression(exp, hold: 60.0, fadeIn: 0.15, fadeOut: 0.4)
+            }
             lipSyncService.startAmplitudeMode()
             SceneKitLipSyncService.shared.startAmplitudeMode()
-            ttsService.speak(text)
+            ttsService.speak(text.withoutEmotionMarkers.withoutGestureMarkers)
+            if let marker = gestureMarker {
+                BuddyGestureService.shared.play(marker: marker)
+            }
 
-            // Observe local TTS state
             observeLocalSpeakingState()
+        }
+    }
+
+    /// Schedules `setExpression` calls on the main queue timed to the audio
+    /// playback. `audioStartTime` is when the first sample hits the speaker;
+    /// each cue's `audioOffsetMs` is relative to that. Cues that already lie
+    /// in the past (e.g. very first bookmark at offset 0) fire immediately.
+    private func scheduleEmotionCues(_ cues: [AzureSpeechService.EmotionCue],
+                                     audioStartTime: Date) {
+        for cue in cues {
+            guard let expression = FacialExpressionService.Expression.fromMarker(cue.emotion) else {
+                continue
+            }
+            let target = audioStartTime.addingTimeInterval(TimeInterval(cue.audioOffsetMs) / 1000.0)
+            let delay = max(0, target.timeIntervalSinceNow)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                // Short hold — next cue (if any) will overwrite it; the
+                // Azure-speaking-state observer clears the last one when audio
+                // ends. Hold is a safety net for the tail segment.
+                if expression == .neutral {
+                    FacialExpressionService.shared.clearExpression(fadeOut: 0.25)
+                } else {
+                    FacialExpressionService.shared.setExpression(
+                        expression,
+                        hold: 60.0,
+                        fadeIn: 0.12,
+                        fadeOut: 0.3
+                    )
+                }
+            }
         }
     }
 
@@ -646,6 +707,7 @@ class ChatViewModel: ObservableObject {
             .sink { [weak self] _ in
                 self?.lipSyncService.stopAnimation()
                 SceneKitLipSyncService.shared.stopAnimation()
+                FacialExpressionService.shared.clearExpression()
             }
             .store(in: &cancellables)
     }
@@ -661,6 +723,7 @@ class ChatViewModel: ObservableObject {
             .sink { [weak self] _ in
                 self?.lipSyncService.stopAnimation()
                 SceneKitLipSyncService.shared.stopAnimation()
+                FacialExpressionService.shared.clearExpression()
             }
             .store(in: &cancellables)
     }

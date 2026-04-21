@@ -175,8 +175,39 @@ struct BuddySystemPrompt {
         Du bist \(buddyName), ein freundlicher AR-Begleiter.
         Antworte kurz auf Deutsch (1-2 Sätze).
         Sei hilfsbereit und freundlich.
+
+        \(Self.emotionMarkerInstructions)
         """
     }
+
+    /// Shared instructions appended to every prompt — tells Claude how to emit
+    /// inline emotion markers so the buddy's face can change mid-response.
+    static let emotionMarkerInstructions: String = """
+    ## Emotions-Marker (WICHTIG)
+    Setze in deine Antworten Emotions-Marker in eckigen Klammern, damit dein Gesicht passend animiert wird. Wechsle die Emotion so oft es sich natürlich anfühlt — mindestens am Satzanfang, gern auch innerhalb eines Satzes.
+
+    Verfügbare Marker (genau so schreiben):
+    [emotion:happy] [emotion:laughter] [emotion:sad] [emotion:melancholy] [emotion:angry] [emotion:surprised] [emotion:fear] [emotion:disgust] [emotion:thinking] [emotion:skeptical] [emotion:wonder] [emotion:neutral]
+
+    Regeln:
+    - Platziere den Marker direkt VOR dem Text, der in dieser Emotion gesagt werden soll.
+    - Kehre am Ende von emotionalen Passagen mit [emotion:neutral] zum Normalzustand zurück.
+    - Die Marker werden aus dem gesprochenen Text entfernt — schreib sie nur als Steuertags, nicht als Teil deines Satzes.
+
+    Beispiel:
+    [emotion:happy] Hey, schön dich zu sehen! [emotion:thinking] Hmm, das ist eine gute Frage. [emotion:surprised] Oh wow, das hätte ich nicht gedacht! [emotion:neutral] Lass mich kurz nachschauen.
+
+    ## Gesten-Marker
+    Du kannst zusätzlich maximal eine Körperbewegung pro Antwort triggern. Setze den Marker ganz an den Anfang der Antwort — er feuert, sobald du zu sprechen beginnst.
+
+    Kurze prozedurale Gesten (überlappen mit Sprache, ~0.5–1s):
+    [gesture:nod] (Zustimmen), [gesture:shake] (Verneinen), [gesture:jump] (Freude / Aufregung), [gesture:cheer] (Feiern), [gesture:bow] (Begrüßen / Dank), [gesture:wiggle] (verspielt), [gesture:lookLeft], [gesture:lookRight]
+
+    Längere Ganzkörper-Animationen (ca. 1–3s, nutze sie wenn der Ausdruck es rechtfertigt):
+    [gesture:wave] (Winken / Hallo), [gesture:blowKiss] (Kusshand), [gesture:yesJump] (freudiger Sprung), [gesture:thinking] (nachdenkliche Pose), [gesture:dontKnow] (Schulterzucken / keine Ahnung), [gesture:shy] (schüchtern), [gesture:pointLeft], [gesture:pointUp], [gesture:pointDown], [gesture:frustration] (genervt), [gesture:crossedArms] (Arme verschränkt), [gesture:awake] (aufwachen / aufmerksam werden)
+
+    Nutze Gesten sparsam — nur wenn sie den Ausdruck wirklich unterstützen. Maximal eine Geste pro Antwort. Bei normalen Antworten keinen Gesten-Marker setzen.
+    """
 
     /// Builds the full system prompt
     var prompt: String {
@@ -212,7 +243,10 @@ struct BuddySystemPrompt {
             lines.append("<tool_call>{\"name\": \"tool_name\", \"parameters\": {...}}</tool_call>")
             lines.append("")
             lines.append("Verwende Tools nur wenn nötig. Für einfache Fragen antworte direkt.")
+            lines.append("")
         }
+
+        lines.append(Self.emotionMarkerInstructions)
 
         return lines.joined(separator: "\n")
     }
@@ -270,5 +304,67 @@ extension String {
             result.removeSubrange(fullRange)
         }
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Removes `[emotion:xxx]` markers from the string (for UI display & TTS
+    /// fallback paths that don't consume the markers themselves).
+    var withoutEmotionMarkers: String {
+        let pattern = #"\[emotion:[a-zA-Z]+\]"#
+        return self.replacingOccurrences(of: pattern, with: "",
+                                         options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Removes `[gesture:xxx]` markers from the string.
+    var withoutGestureMarkers: String {
+        let pattern = #"\[gesture:[a-zA-Z]+\]"#
+        return self.replacingOccurrences(of: pattern, with: "",
+                                         options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Returns the first `[gesture:xxx]` marker name (lowercased), if any.
+    /// We only support one gesture per response — mirrors the LLM instruction.
+    var firstGestureMarker: String? {
+        let pattern = #"\[gesture:([a-zA-Z]+)\]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: self,
+                                           range: NSRange(location: 0, length: (self as NSString).length)),
+              match.numberOfRanges > 1
+        else { return nil }
+        return (self as NSString).substring(with: match.range(at: 1)).lowercased()
+    }
+
+    /// Splits the string at `[emotion:xxx]` markers into ordered
+    /// `(text, emotion)` segments. Emotion is the marker preceding the text;
+    /// the leading chunk before the first marker has `emotion == nil`.
+    /// Empty text chunks are preserved so bookmark timing stays stable.
+    var emotionSegments: [(text: String, emotion: String?)] {
+        let pattern = #"\[emotion:([a-zA-Z]+)\]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return [(self, nil)]
+        }
+        let ns = self as NSString
+        let matches = regex.matches(in: self, range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return [(self, nil)] }
+
+        var segments: [(String, String?)] = []
+        var cursor = 0
+        var pendingEmotion: String? = nil
+
+        for match in matches {
+            let markerStart = match.range.location
+            let markerEnd = markerStart + match.range.length
+            if markerStart > cursor {
+                let chunk = ns.substring(with: NSRange(location: cursor, length: markerStart - cursor))
+                segments.append((chunk, pendingEmotion))
+            }
+            pendingEmotion = ns.substring(with: match.range(at: 1))
+            cursor = markerEnd
+        }
+        if cursor < ns.length {
+            segments.append((ns.substring(from: cursor), pendingEmotion))
+        }
+        return segments
     }
 }
