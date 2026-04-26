@@ -32,8 +32,9 @@ class LipSyncService: ObservableObject {
     // MARK: - Private Properties
 
     private var displayLink: CADisplayLink?
-    private var buddyEntity: ModelEntity?
+    private var buddyEntity: Entity?
     private var jawJointIndex: Int?
+    private var jawDriveEntity: Entity?
     private var originalJawTransform: Transform?
 
     private var visemeQueue = VisemeQueue()
@@ -50,10 +51,18 @@ class LipSyncService: ObservableObject {
     private var blendShapeTargets: [RealityKitBlendShapeTarget] = []
     private var currentBlendShapes: [String: Float] = [:]
     private var targetBlendShapes: [String: Float] = [:]
+    private var lastLoggedRealityKitVisemeId: Int = -1
+    private var didLogRealityKitBlendWrite = false
+    private var didLogJawFallbackDrive = false
+    private var realityKitBlendAnimationControllers: [AnimationPlaybackController] = []
+    private let realityKitBlendShapeWeightScale: Float = 1.0
+    private let realityKitSampledAnimationLead: TimeInterval = 0.10
 
     private struct RealityKitBlendShapeTarget {
         let entity: Entity
         let weightSetID: String
+        let weightSetIndex: Int
+        let weightNames: [String]
         let indexByShapeName: [String: Int]
     }
 
@@ -69,11 +78,14 @@ class LipSyncService: ObservableObject {
 
     /// Configures lip sync for a buddy entity
     /// Call this when the buddy model is loaded/placed
-    func configure(for entity: ModelEntity, capabilities: ModelCapabilities) {
+    func configure(for entity: Entity, capabilities: ModelCapabilities) {
         self.buddyEntity = entity
         self.modelCapabilities = capabilities
         self.currentMode = capabilities.recommendedLipSyncMode
         self.blendShapeTargets = collectRealityKitBlendShapeTargets(from: entity)
+        self.didLogRealityKitBlendWrite = false
+        self.didLogJawFallbackDrive = false
+        self.lastLoggedRealityKitVisemeId = -1
 
         // Cache jaw joint if available
         if let jawName = capabilities.jawJointName {
@@ -86,10 +98,17 @@ class LipSyncService: ObservableObject {
             currentMode = .blendShapes
             let targetCount = blendShapeTargets.reduce(0) { $0 + $1.indexByShapeName.count }
             print("[LipSync] RealityKit blend shape targets available: \(blendShapeTargets.count) weight set(s), \(targetCount) mapped names")
+        } else if capabilities.hasJawJoint {
+            currentMode = .visemeToJaw
+            print("[LipSync] No usable RealityKit face blend-shape target found; using jaw/mouth entity fallback")
+        } else if currentMode == .blendShapes {
+            currentMode = .amplitudeBased
+            print("[LipSync] No usable RealityKit face blend-shape target found; using amplitude fallback")
         }
 
         print("[LipSync] Configured with mode: \(currentMode.displayName)")
         print("[LipSync] Capabilities: blendShapes=\(capabilities.hasBlendShapes), jawJoint=\(capabilities.hasJawJoint)")
+
     }
 
     /// Sets the lip sync mode manually
@@ -104,7 +123,9 @@ class LipSyncService: ObservableObject {
     /// - Parameters:
     ///   - visemes: Array of viseme events with timing
     ///   - audioStartTime: The exact time audio playback started (for sync). If nil, uses current time.
-    func startAnimation(with visemes: [VisemeEvent], audioStartTime: Date? = nil) {
+    func startAnimation(with visemes: [VisemeEvent],
+                        audioStartTime: Date? = nil,
+                        audioDuration: TimeInterval? = nil) {
         guard currentMode != .disabled else { return }
         guard !visemes.isEmpty else {
             print("[LipSync] No visemes provided, using amplitude fallback")
@@ -119,10 +140,49 @@ class LipSyncService: ObservableObject {
         self.audioStartTime = audioStartTime ?? Date()
         state = .animating(progress: 0.0)
 
-        startDisplayLink()
+        logLipSyncTiming(visemes: visemes, audioDuration: audioDuration)
+        if currentMode == .blendShapes, !blendShapeTargets.isEmpty {
+            // Body mocap is a RealityKit animation on the same character.
+            // Drive lips through component writes so skeletal body animation
+            // can keep running instead of competing with a second animation
+            // resource on the same bind tree.
+            stopRealityKitBlendShapeAnimation()
+            startDisplayLink()
+        } else {
+            startDisplayLink()
+        }
 
         let timeSinceStart = Date().timeIntervalSince(self.audioStartTime!)
         print("[LipSync] Started animation with \(visemes.count) visemes, sync offset: \(String(format: "%.3f", timeSinceStart))s")
+    }
+
+    private func logLipSyncTiming(visemes: [VisemeEvent], audioDuration: TimeInterval?) {
+        let sortedVisemes = visemes.sorted { $0.audioOffset < $1.audioOffset }
+        guard let first = sortedVisemes.first, let last = sortedVisemes.last else { return }
+
+        let firstNonSilent = sortedVisemes.first { $0.visemeId != 0 }
+        let lastNonSilent = sortedVisemes.last { $0.visemeId != 0 }
+        let nonSilentCount = sortedVisemes.filter { $0.visemeId != 0 }.count
+        let visemeDuration = last.audioOffset
+        let audioDurationText = audioDuration.map { String(format: "%.3f", $0) } ?? "unknown"
+        let tailGap = audioDuration.map { $0 - visemeDuration }
+        let tailGapText = tailGap.map { String(format: "%.3f", $0) } ?? "unknown"
+        let firstNonSilentText = firstNonSilent.map { String(format: "%.3f", $0.audioOffset) } ?? "none"
+        let lastNonSilentText = lastNonSilent.map { String(format: "%.3f", $0.audioOffset) } ?? "none"
+        let largestGaps = zip(sortedVisemes, sortedVisemes.dropFirst())
+            .map { previous, next in
+                (from: previous.audioOffset, to: next.audioOffset, gap: next.audioOffset - previous.audioOffset)
+            }
+            .filter { $0.gap >= 0.28 }
+            .sorted { $0.gap > $1.gap }
+            .prefix(6)
+            .map { String(format: "%.2f-%.2fs gap=%.2f", $0.from, $0.to, $0.gap) }
+            .joined(separator: " | ")
+
+        print("[LipSync/SYNC] audioDuration=\(audioDurationText)s visemeLast=\(String(format: "%.3f", visemeDuration))s tailGap=\(tailGapText)s first=\(String(format: "%.3f", first.audioOffset))s firstNonSilent=\(firstNonSilentText)s lastNonSilent=\(lastNonSilentText)s count=\(sortedVisemes.count) nonSilent=\(nonSilentCount)")
+        if !largestGaps.isEmpty {
+            print("[LipSync/SYNC] largestVisemeGaps \(largestGaps)")
+        }
     }
 
     /// Starts amplitude-based lip sync (fallback when no visemes)
@@ -146,6 +206,7 @@ class LipSyncService: ObservableObject {
     /// Stops lip sync animation
     func stopAnimation() {
         stopDisplayLink()
+        stopRealityKitBlendShapeAnimation()
         resetJaw()
 
         visemeQueue.reset()
@@ -155,6 +216,9 @@ class LipSyncService: ObservableObject {
         currentAmplitude = 0.0
         currentBlendShapes.removeAll()
         targetBlendShapes.removeAll()
+        lastLoggedRealityKitVisemeId = -1
+        didLogRealityKitBlendWrite = false
+        didLogJawFallbackDrive = false
 
         state = .finished
 
@@ -171,8 +235,10 @@ class LipSyncService: ObservableObject {
         stopAnimation()
         buddyEntity = nil
         jawJointIndex = nil
+        jawDriveEntity = nil
         originalJawTransform = nil
         blendShapeTargets.removeAll()
+        realityKitBlendAnimationControllers.removeAll()
         modelCapabilities = .none
     }
 
@@ -236,7 +302,7 @@ class LipSyncService: ObservableObject {
 
         let rawJaw = VisemeJawMapping.jawOpenness(for: viseme.visemeId)
         let clampedJaw: Float = rawJaw < 0.06 ? 0.0 : rawJaw
-        let boostedJaw: Float = min(clampedJaw * 1.5, 1.0)
+        let boostedJaw: Float = min(clampedJaw * 0.75, 0.65)
 
         if let blendShapes = viseme.blendShapes {
             targetBlendShapes = blendShapes
@@ -245,19 +311,30 @@ class LipSyncService: ObservableObject {
             var shapes: [String: Float] = [:]
             if clampedJaw > 0 {
                 let rawShapes = VisemeBlendShapeMapping.blendShapes(for: viseme.visemeId)
-                let auxiliaryGain: Float = 0.7
+                let auxiliaryGain: Float = 0.35
                 for (name, value) in rawShapes where name != "jawOpen" {
                     shapes[name] = min(value * auxiliaryGain, 1.0)
                 }
                 shapes["jawOpen"] = boostedJaw
             }
             if viseme.visemeId == 21 {
-                shapes["mouthClose"] = 0.6
-                shapes["mouthPressLeft"] = 0.4
-                shapes["mouthPressRight"] = 0.4
+                shapes["mouthClose"] = 0.35
+                shapes["mouthPressLeft"] = 0.2
+                shapes["mouthPressRight"] = 0.2
             }
             targetBlendShapes = shapes
             targetJawOpenness = boostedJaw
+        }
+
+        if viseme.visemeId != lastLoggedRealityKitVisemeId {
+            lastLoggedRealityKitVisemeId = viseme.visemeId
+            let names = targetBlendShapes
+                .filter { $0.value > 0.01 }
+                .sorted { $0.key < $1.key }
+                .prefix(4)
+                .map { "\($0.key)=\(String(format: "%.2f", $0.value))" }
+                .joined(separator: ", ")
+            print("[LipSync/RK] Viseme \(viseme.visemeId) target jaw=\(String(format: "%.2f", targetJawOpenness)) shapes=[\(names)]")
         }
     }
 
@@ -274,6 +351,7 @@ class LipSyncService: ObservableObject {
             lastVisemeId = viseme.visemeId
             targetJawOpenness = VisemeJawMapping.jawOpenness(for: viseme.visemeId)
             targetBlendShapes = targetJawOpenness > 0 ? ["jawOpen": targetJawOpenness] : [:]
+            print("[LipSync/Jaw] Viseme \(viseme.visemeId) target jaw=\(String(format: "%.2f", targetJawOpenness))")
         }
     }
 
@@ -316,20 +394,28 @@ class LipSyncService: ObservableObject {
 
     // MARK: - Jaw Joint Methods
 
-    private func findJawJoint(named name: String, in entity: ModelEntity) {
-        // Try to find joint in skeleton
-        // RealityKit's joint access is limited, we'll store the name for later use
+    private func findJawJoint(named name: String, in entity: Entity) {
         print("[LipSync] Looking for jaw joint: \(name)")
 
-        // For now, we'll use transform-based animation on the entity itself
-        // Full skeleton joint access requires more complex setup with AnimationResource
-        jawJointIndex = 0  // Placeholder - actual implementation depends on model structure
-        originalJawTransform = entity.transform
+        if let target = findEntity(named: name, in: entity) {
+            jawDriveEntity = target
+            jawJointIndex = 0
+            originalJawTransform = target.transform
+            let hasModel = target.components[ModelComponent.self] != nil
+            print("[LipSync] Using jaw/mouth drive entity: \(target.name) children=\(target.children.count) hasModel=\(hasModel)")
+        } else {
+            jawDriveEntity = entity
+            jawJointIndex = 0
+            originalJawTransform = entity.transform
+            print("[LipSync] Jaw entity '\(name)' not found; using root transform fallback")
+        }
     }
 
-    private func applyJawRotation(to entity: ModelEntity, jointIndex: Int, openness: Float) {
+    private func applyJawRotation(to entity: Entity, jointIndex: Int, openness: Float) {
+        let targetEntity = jawDriveEntity ?? entity
+
         // Calculate rotation angle based on openness
-        let maxAngle = configuration.maxJawAngle
+        let maxAngle: Float = 0.85
         let angle = openness * maxAngle
 
         // Rotate around X axis (opening jaw downward)
@@ -339,12 +425,19 @@ class LipSyncService: ObservableObject {
         var newTransform = original
         let rotationDelta = simd_quatf(angle: angle, axis: SIMD3<Float>(1, 0, 0))
         newTransform.rotation = original.rotation * rotationDelta
+        newTransform.translation.y = original.translation.y - (openness * 0.055)
+        newTransform.translation.z = original.translation.z + (openness * 0.018)
+        newTransform.scale = original.scale * SIMD3<Float>(1.0, 1.0 + openness * 0.25, 1.0)
 
-        // Apply with smooth transition
-        entity.move(to: newTransform, relativeTo: entity.parent, duration: 0.016)
+        if !didLogJawFallbackDrive, openness > 0.05 {
+            didLogJawFallbackDrive = true
+            print("[LipSync/Jaw] Driving '\(targetEntity.name)' openness=\(String(format: "%.2f", openness)) yDelta=\(String(format: "%.3f", openness * 0.055))")
+        }
+
+        targetEntity.transform = newTransform
     }
 
-    private func applyScaleFallback(to entity: ModelEntity, openness: Float) {
+    private func applyScaleFallback(to entity: Entity, openness: Float) {
         // Minimal fallback: slightly adjust Y scale to simulate mouth movement
         // This is very subtle but provides some visual feedback
         let baseScale = entity.scale.x  // Assume uniform base scale
@@ -359,7 +452,9 @@ class LipSyncService: ObservableObject {
 
         resetRealityKitBlendShapes()
 
-        if let original = originalJawTransform {
+        if let targetEntity = jawDriveEntity, let original = originalJawTransform {
+            targetEntity.move(to: original, relativeTo: targetEntity.parent, duration: 0.1)
+        } else if let original = originalJawTransform {
             entity.move(to: original, relativeTo: entity.parent, duration: 0.1)
         }
 
@@ -393,9 +488,12 @@ class LipSyncService: ObservableObject {
             }
         }
 
+        var wroteAnyWeight = false
+        var maxWrittenValue: Float = 0
+
         for target in blendShapeTargets {
             guard var component = target.entity.components[BlendShapeWeightsComponent.self],
-                  var data = component.weightSet[target.weightSetID] else {
+                  var data = blendShapeWeightsData(in: component, for: target.weightSetID) else {
                 continue
             }
 
@@ -406,11 +504,19 @@ class LipSyncService: ObservableObject {
                       index < weights.endIndex else {
                     continue
                 }
-                weights[index] = value
+                let scaledValue = scaledRealityKitBlendShapeWeight(value)
+                weights[index] = scaledValue
+                wroteAnyWeight = true
+                maxWrittenValue = max(maxWrittenValue, scaledValue)
             }
             data.weights = weights
-            component.weightSet.set(data)
+            setBlendShapeWeightsData(data, in: &component, for: target.weightSetID)
             target.entity.components[BlendShapeWeightsComponent.self] = component
+        }
+
+        if !didLogRealityKitBlendWrite, wroteAnyWeight {
+            didLogRealityKitBlendWrite = true
+            print("[LipSync/RK] Writing RealityKit blend weights to \(blendShapeTargets.count) target(s), max=\(String(format: "%.2f", maxWrittenValue))")
         }
 
         return true
@@ -421,7 +527,7 @@ class LipSyncService: ObservableObject {
 
         for target in blendShapeTargets {
             guard var component = target.entity.components[BlendShapeWeightsComponent.self],
-                  var data = component.weightSet[target.weightSetID] else {
+                  var data = blendShapeWeightsData(in: component, for: target.weightSetID) else {
                 continue
             }
 
@@ -430,9 +536,162 @@ class LipSyncService: ObservableObject {
                 weights[index] = 0
             }
             data.weights = weights
-            component.weightSet.set(data)
+            setBlendShapeWeightsData(data, in: &component, for: target.weightSetID)
             target.entity.components[BlendShapeWeightsComponent.self] = component
         }
+    }
+
+    private func startRealityKitBlendShapeAnimation(with visemes: [VisemeEvent],
+                                                    audioDuration: TimeInterval? = nil) {
+        stopRealityKitBlendShapeAnimation()
+        guard !blendShapeTargets.isEmpty, !visemes.isEmpty else { return }
+
+        let sortedVisemes = visemes.sorted { $0.audioOffset < $1.audioOffset }
+        let frameInterval: TimeInterval = 1.0 / 30.0
+        let lead = realityKitSampledAnimationLead
+        let lastOffset = sortedVisemes.last?.audioOffset ?? 0
+        let targetDuration = audioDuration ?? lastOffset
+        let duration = max(targetDuration - lead, frameInterval)
+        let frameCount = max(Int(ceil(duration / frameInterval)) + 1, 2)
+        print("[LipSync/SYNC] sampledDuration=\(String(format: "%.3f", duration))s lead=\(String(format: "%.3f", lead))s frameCount=\(frameCount) frameInterval=\(String(format: "%.3f", frameInterval))s")
+
+        for target in blendShapeTargets {
+            var maxFrameWeight: Float = 0
+            let frames = (0..<frameCount).map { frameIndex -> BlendShapeWeights in
+                let time = min(lead + TimeInterval(frameIndex) * frameInterval, targetDuration)
+                let viseme = viseme(in: sortedVisemes, at: time)
+                let weights = blendShapeWeights(for: viseme, target: target)
+                maxFrameWeight = max(maxFrameWeight, weights.map { $0 }.max() ?? 0)
+                return weights
+            }
+
+            let bindTarget = blendShapeBindTarget(for: target)
+            let animationDefinition = SampledAnimation<BlendShapeWeights>(
+                weightNames: target.weightNames,
+                frames: frames,
+                name: "LipSync_BlendShapes_\(target.entity.name)",
+                tweenMode: .linear,
+                frameInterval: Float(frameInterval),
+                isAdditive: false,
+                bindTarget: bindTarget,
+                blendLayer: 100,
+                repeatMode: .none,
+                fillMode: []
+            )
+
+            do {
+                let animation = try AnimationResource.generate(with: animationDefinition)
+                let controller = target.entity.playAnimation(
+                    animation,
+                    transitionDuration: 0,
+                    blendLayerOffset: 0,
+                    separateAnimatedValue: true,
+                    startsPaused: false
+                )
+                realityKitBlendAnimationControllers.append(controller)
+                print("[LipSync/RK] Playing sampled blend-shape animation on '\(target.entity.name)' frames=\(frames.count) weights=\(target.weightNames.count) max=\(String(format: "%.2f", maxFrameWeight))")
+            } catch {
+                print("[LipSync/RK] Failed to create sampled blend-shape animation: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func stopRealityKitBlendShapeAnimation() {
+        for controller in realityKitBlendAnimationControllers {
+            controller.stop()
+        }
+        realityKitBlendAnimationControllers.removeAll()
+    }
+
+    private func viseme(in visemes: [VisemeEvent], at time: TimeInterval) -> VisemeEvent? {
+        var result: VisemeEvent?
+        for viseme in visemes {
+            if viseme.audioOffset <= time {
+                result = viseme
+            } else {
+                break
+            }
+        }
+        return result
+    }
+
+    private func blendShapeWeights(for viseme: VisemeEvent?,
+                                   target: RealityKitBlendShapeTarget) -> BlendShapeWeights {
+        let shapes = targetBlendShapes(for: viseme)
+        return blendShapeWeights(from: shapes, target: target)
+    }
+
+    private func blendShapeWeights(from shapes: [String: Float],
+                                   target: RealityKitBlendShapeTarget) -> BlendShapeWeights {
+        var values = Array(repeating: Float(0), count: target.weightNames.count)
+
+        for (shapeName, value) in shapes {
+            guard let index = target.indexByShapeName[shapeName],
+                  index >= values.startIndex,
+                  index < values.endIndex else {
+                continue
+            }
+            values[index] = scaledRealityKitBlendShapeWeight(value)
+        }
+
+        return BlendShapeWeights(values)
+    }
+
+    private func targetBlendShapes(for viseme: VisemeEvent?) -> [String: Float] {
+        guard let viseme else { return [:] }
+
+        let rawJaw = VisemeJawMapping.jawOpenness(for: viseme.visemeId)
+        let clampedJaw: Float = rawJaw < 0.06 ? 0.0 : rawJaw
+        let boostedJaw: Float = min(clampedJaw * 0.75, 0.65)
+
+        if let blendShapes = viseme.blendShapes {
+            return blendShapes
+        }
+
+        var shapes: [String: Float] = [:]
+        if clampedJaw > 0 {
+            let rawShapes = VisemeBlendShapeMapping.blendShapes(for: viseme.visemeId)
+            let auxiliaryGain: Float = 0.35
+            for (name, value) in rawShapes where name != "jawOpen" {
+                shapes[name] = min(value * auxiliaryGain, 1.0)
+            }
+            shapes["jawOpen"] = boostedJaw
+        }
+        if viseme.visemeId == 21 {
+            shapes["mouthClose"] = 0.35
+            shapes["mouthPressLeft"] = 0.2
+            shapes["mouthPressRight"] = 0.2
+        }
+        return shapes
+    }
+
+    private func blendShapeBindTarget(for target: RealityKitBlendShapeTarget) -> BindTarget {
+        if !target.weightSetID.isEmpty {
+            return .blendShapeWeightsWithID(target.weightSetID)
+        }
+        return .blendShapeWeightsAtIndex(target.weightSetIndex)
+    }
+
+    private func blendShapeWeightsData(in component: BlendShapeWeightsComponent,
+                                       for weightSetID: String) -> BlendShapeWeightsData? {
+        if weightSetID.isEmpty {
+            return component.weightSet.default
+        }
+        return component.weightSet[weightSetID]
+    }
+
+    private func setBlendShapeWeightsData(_ data: BlendShapeWeightsData,
+                                          in component: inout BlendShapeWeightsComponent,
+                                          for weightSetID: String) {
+        if weightSetID.isEmpty {
+            component.weightSet.default = data
+        } else {
+            component.weightSet.set(data)
+        }
+    }
+
+    private func scaledRealityKitBlendShapeWeight(_ value: Float) -> Float {
+        value * realityKitBlendShapeWeightScale
     }
 
     private func collectRealityKitBlendShapeTargets(from entity: Entity) -> [RealityKitBlendShapeTarget] {
@@ -440,17 +699,22 @@ class LipSyncService: ObservableObject {
 
         func visit(_ current: Entity) {
             if let component = current.components[BlendShapeWeightsComponent.self] {
-                for data in component.weightSet {
+                for (weightSetIndex, data) in component.weightSet.enumerated() {
                     let indexMap = makeBlendShapeIndexMap(from: data.weightNames)
-                    if !indexMap.isEmpty {
+                    if !indexMap.isEmpty && isUsableRealityKitFaceBlendShapeTarget(entityName: current.name, weightNames: data.weightNames) {
                         result.append(
                             RealityKitBlendShapeTarget(
                                 entity: current,
                                 weightSetID: data.id,
+                                weightSetIndex: weightSetIndex,
+                                weightNames: data.weightNames,
                                 indexByShapeName: indexMap
                             )
                         )
                         print("[LipSync] Found RealityKit blend weight set '\(data.id)' on '\(current.name)' with \(data.weightNames.count) weights")
+                    } else if !indexMap.isEmpty {
+                        let sample = data.weightNames.prefix(4).joined(separator: ", ")
+                        print("[LipSync] Skipping non-primary RealityKit blend weight set on '\(current.name)' sample=[\(sample)]")
                     }
                 }
             }
@@ -462,6 +726,54 @@ class LipSyncService: ObservableObject {
 
         visit(entity)
         return result
+    }
+
+    private func isUsableRealityKitFaceBlendShapeTarget(entityName: String, weightNames: [String]) -> Bool {
+        let canonicalNames = weightNames.map(canonicalBlendShapeName)
+        let hasLipSyncShapes = canonicalNames.contains { name in
+            ARKitBlendShapes.lipSyncShapes.contains { lipShape in
+                name.caseInsensitiveCompare(lipShape) == .orderedSame
+            }
+        }
+        guard hasLipSyncShapes else { return false }
+
+        let lowerEntityName = entityName.lowercased()
+        if lowerEntityName.contains("eyelash") ||
+            lowerEntityName.contains("tear") ||
+            lowerEntityName.contains("eyebrow") ||
+            lowerEntityName.contains("eye") {
+            return false
+        }
+
+        return true
+    }
+
+    private func findEntity(named name: String, in entity: Entity) -> Entity? {
+        var bestMatch: Entity?
+        var bestScore = Int.min
+
+        func visit(_ current: Entity, depth: Int) {
+            if current.name.caseInsensitiveCompare(name) == .orderedSame {
+                var score = depth
+                if current.components[ModelComponent.self] != nil {
+                    score += 1000
+                }
+                if current.components[BlendShapeWeightsComponent.self] != nil {
+                    score += 500
+                }
+                if score > bestScore {
+                    bestScore = score
+                    bestMatch = current
+                }
+            }
+
+            for child in current.children {
+                visit(child, depth: depth + 1)
+            }
+        }
+
+        visit(entity, depth: 0)
+        return bestMatch
     }
 
     private func collectRealityKitBlendShapeNames(from entity: Entity) -> [String] {
@@ -510,12 +822,13 @@ class LipSyncService: ObservableObject {
 
 extension LipSyncService {
     /// Inspects a model entity and returns its lip sync capabilities
-    func inspectModel(_ entity: ModelEntity) async -> ModelCapabilities {
+    func inspectModel(_ entity: Entity) async -> ModelCapabilities {
         let blendShapes = collectRealityKitBlendShapeNames(from: entity)
         var joints: [String] = []
 
         // Inspect mesh for blend shapes
-        if let model = entity.model {
+        if let modelEntity = entity as? ModelEntity,
+           let model = modelEntity.model {
             print("[LipSync] Model has \(model.materials.count) materials")
         }
 

@@ -205,7 +205,8 @@ final class BuddyMocapService {
     /// Plays `clip` on a RealityKit entity. Returns true if an animation
     /// was attached.
     @discardableResult
-    func play(_ clip: MocapClip, on entity: ModelEntity, loop: Bool = true) -> Bool {
+    func play(_ clip: MocapClip, on entity: Entity, loop: Bool = true) -> Bool {
+        let hasExternalClipAsset = realityKitClipURL(for: clip) != nil
         let resource: AnimationResource?
         if let cached = realityKitCache[clip] {
             resource = cached
@@ -219,6 +220,11 @@ final class BuddyMocapService {
         // Prefer the requested mocap resource. Falling back to the entity's
         // own embedded animation keeps older assets alive when no external
         // clip is available, but must not shadow an explicitly loaded clip.
+        if resource == nil, hasExternalClipAsset {
+            print("[BuddyMocap] RealityKit \(clip.rawValue): external clip asset exists but has no usable animation")
+            return false
+        }
+
         let anim = resource ?? entity.availableAnimations.first
         guard let playable = anim else {
             print("[BuddyMocap] RealityKit \(clip.rawValue): no animation found")
@@ -232,11 +238,7 @@ final class BuddyMocapService {
     }
 
     private func loadRealityKit(_ clip: MocapClip) -> AnimationResource? {
-        guard let url = Bundle.main.url(
-            forResource: clip.rawValue,
-            withExtension: "usdz",
-            subdirectory: Self.subdir
-        ) ?? Bundle.main.url(forResource: clip.rawValue, withExtension: "usdz") else {
+        guard let url = realityKitClipURL(for: clip) else {
             return nil
         }
         do {
@@ -267,5 +269,13 @@ final class BuddyMocapService {
         }
 
         return nil
+    }
+
+    private func realityKitClipURL(for clip: MocapClip) -> URL? {
+        Bundle.main.url(
+            forResource: clip.rawValue,
+            withExtension: "usdz",
+            subdirectory: Self.subdir
+        ) ?? Bundle.main.url(forResource: clip.rawValue, withExtension: "usdz")
     }
 }
