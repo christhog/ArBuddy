@@ -142,6 +142,20 @@ final class BuddyMocapService {
         }
     }
 
+    /// Tear-down before swapping buddies: stop all clips on the outgoing
+    /// node and drop both caches. The cached `SCNAnimation`s reference
+    /// bone-name paths from the previous skeleton; keeping them around
+    /// wastes RAM and risks re-binding onto a different character.
+    func stopAndFlush(on buddyNode: SCNNode?) {
+        if let buddyNode {
+            stop(on: buddyNode)
+        }
+        sceneKitCache.removeAll()
+        realityKitCache.removeAll()
+        activeSceneKitNode = nil
+        activeClip = nil
+    }
+
     private func sceneKitClip(for clip: MocapClip) -> SceneKitClip? {
         if let cached = sceneKitCache[clip] { return cached }
 
@@ -202,11 +216,10 @@ final class BuddyMocapService {
             resource = nil
         }
 
-        // Prefer the entity's own availableAnimations if present (RealityKit
-        // sometimes binds the animation to the cloned entity directly after
-        // a USDZ load). Fall back to our cached resource so older entities
-        // still get a clip.
-        let anim = entity.availableAnimations.first ?? resource
+        // Prefer the requested mocap resource. Falling back to the entity's
+        // own embedded animation keeps older assets alive when no external
+        // clip is available, but must not shadow an explicitly loaded clip.
+        let anim = resource ?? entity.availableAnimations.first
         guard let playable = anim else {
             print("[BuddyMocap] RealityKit \(clip.rawValue): no animation found")
             return false
@@ -227,11 +240,32 @@ final class BuddyMocapService {
             return nil
         }
         do {
-            let entity = try ModelEntity.loadModel(contentsOf: url)
-            return entity.availableAnimations.first
+            // Mocap USDZs are animation scenes, not always a single ModelEntity
+            // root. Loading through Entity avoids RealityKit's wrongEntityType
+            // failure and lets us search the full hierarchy for the clip.
+            let entity = try Entity.load(contentsOf: url)
+            if let animation = firstAnimation(in: entity) {
+                return animation
+            }
+            print("[BuddyMocap] RealityKit \(clip.rawValue): USDZ loaded but no animation found")
+            return nil
         } catch {
             print("[BuddyMocap] RealityKit load failed for \(clip.rawValue): \(error)")
             return nil
         }
+    }
+
+    private func firstAnimation(in entity: Entity) -> AnimationResource? {
+        if let animation = entity.availableAnimations.first {
+            return animation
+        }
+
+        for child in entity.children {
+            if let animation = firstAnimation(in: child) {
+                return animation
+            }
+        }
+
+        return nil
     }
 }

@@ -738,17 +738,34 @@ class SupabaseService: ObservableObject {
             _ = try await fetchBuddies()
         }
 
-        // Get buddy ID from current user
-        guard let buddyId = currentUser?.selectedBuddyId else {
-            // Return default buddy if no selection
-            let defaultBuddy = availableBuddies.first { $0.isDefault }
-            selectedBuddy = defaultBuddy
-            return defaultBuddy
+        // Resolve the persisted DB choice (or the DB-marked default if the
+        // user hasn't picked one yet).
+        let persisted: Buddy?
+        if let buddyId = currentUser?.selectedBuddyId {
+            persisted = availableBuddies.first { $0.id == buddyId }
+        } else {
+            persisted = availableBuddies.first { $0.isDefault }
         }
 
-        let buddy = availableBuddies.first { $0.id == buddyId }
-        selectedBuddy = buddy
-        return buddy
+        let guarded = applyLowMemoryGuardrail(to: persisted)
+        selectedBuddy = guarded
+        return guarded
+    }
+
+    /// Swaps the incoming buddy for Micoo on <6 GB devices (anything older
+    /// than iPhone 14). Aleda's 4K body textures OOM the app there; users
+    /// switching between Simulator/iPhone 14+ and iPhone 11 get the
+    /// appropriate buddy every time without touching DB state. On enough
+    /// memory the input is returned unchanged. Called from every code path
+    /// that resolves the current buddy.
+    func applyLowMemoryGuardrail(to buddy: Buddy?) -> Buddy? {
+        let lowMemoryDevice = ProcessInfo.processInfo.physicalMemory < 6_000_000_000
+        guard lowMemoryDevice,
+              let micoo = availableBuddies.first(where: { $0.name.caseInsensitiveCompare("Micoo") == .orderedSame })
+        else {
+            return buddy
+        }
+        return micoo
     }
 
     /// Selects a buddy for the current user

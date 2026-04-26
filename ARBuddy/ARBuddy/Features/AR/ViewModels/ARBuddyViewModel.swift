@@ -15,6 +15,25 @@ enum PlacementMode {
     case manual     // User hat getippt
 }
 
+enum AledaARAnimationClip: String, CaseIterable {
+    case idle
+    case walking
+
+    var displayName: String {
+        switch self {
+        case .idle: return "Idle"
+        case .walking: return "Walking"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .idle: return "figure.stand"
+        case .walking: return "figure.walk"
+        }
+    }
+}
+
 /// Button representation for country selection on AR globe
 struct CountryButton: Identifiable {
     let id: String  // ISO-Code
@@ -47,6 +66,7 @@ class ARBuddyViewModel: ObservableObject {
     @Published var isLipSyncActive = false
     @Published var lipSyncMode: LipSyncMode = .disabled
     @Published var modelCapabilities: ModelCapabilities = .none
+    @Published var selectedAledaARAnimation: AledaARAnimationClip = .idle
 
     // Country Button Overlay State
     @Published var countryButtons: [CountryButton] = []
@@ -240,6 +260,10 @@ class ARBuddyViewModel: ObservableObject {
     /// Toggles buddy visibility
     func toggleBuddy() {
         isBuddyVisible.toggle()
+    }
+
+    func selectAledaARAnimation(_ clip: AledaARAnimationClip) {
+        selectedAledaARAnimation = clip
     }
 
     /// Triggers globe rotation to show the specified country

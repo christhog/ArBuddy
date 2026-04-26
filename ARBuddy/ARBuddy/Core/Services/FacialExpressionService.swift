@@ -91,7 +91,11 @@ final class FacialExpressionService {
 
         var collected: [SCNMorpher] = []
         root.enumerateHierarchy { node, _ in
-            if let m = node.morpher { collected.append(m) }
+            if let m = node.morpher,
+               m.targets.count > 0,
+               self.shouldUseMorpher(node, morpher: m) {
+                collected.append(m)
+            }
         }
         morphers = collected
 
@@ -109,6 +113,58 @@ final class FacialExpressionService {
         }
         print("[FacialExpression] Cached \(morphers.count) morphers for expressions")
         logFaceShapes()
+    }
+
+    /// Excludes body-only DAZ G9 morphers from upper-face expression writes.
+    /// Aleda's body mesh carries a lone `jawOpen` morpher; touching it from the
+    /// expression/lip-sync layers creates visible seams on the skin.
+    private func shouldUseMorpher(_ node: SCNNode, morpher: SCNMorpher) -> Bool {
+        let nodeName = node.name ?? ""
+        let lowerName = nodeName.lowercased()
+        let targetNames = morpher.targets.compactMap(\.name)
+        let isGenesis9BodyLike =
+            lowerName.contains("genesis9") &&
+            !lowerName.contains("genesis9head") &&
+            !lowerName.contains("genesis9mouth") &&
+            !lowerName.contains("genesis9eyes") &&
+            !lowerName.contains("genesis9eyelashes") &&
+            !lowerName.contains("genesis9tear") &&
+            !lowerName.contains("g9eyebrowfibers")
+
+        let isDazBodyJawOnly =
+            (nodeName == "Genesis9" || isGenesis9BodyLike) &&
+            targetNames.count == 1 &&
+            targetNames[0].strippingTrailingDigits() == "jawOpen"
+
+        if isDazBodyJawOnly {
+            return false
+        }
+
+        if isGenesis9BodyLike {
+            return false
+        }
+
+        let hasFaceTargets = targetNames.contains { name in
+            let canonical = name.strippingTrailingDigits().lowercased()
+            return canonical.hasPrefix("eye") ||
+                   canonical.hasPrefix("brow") ||
+                   canonical.hasPrefix("cheek") ||
+                   canonical.hasPrefix("nose") ||
+                   canonical.hasPrefix("mouth") ||
+                   canonical.hasPrefix("jaw") ||
+                   canonical == "tongueout"
+        }
+
+        if lowerName.hasPrefix("genesis9mouth") ||
+            lowerName.hasPrefix("genesis9head") ||
+            lowerName.hasPrefix("g9eyebrowfibers") ||
+            lowerName.hasPrefix("genesis9eyes") ||
+            lowerName.hasPrefix("genesis9eyelashes") ||
+            lowerName.hasPrefix("genesis9tear") {
+            return hasFaceTargets
+        }
+
+        return true
     }
 
     /// Diagnostic: lists the brow/eye/cheek blendshape names actually present on

@@ -87,6 +87,7 @@ struct BuddyPreviewView: UIViewRepresentable {
         scnView.addGestureRecognizer(doubleTapGesture)
 
         context.coordinator.scnView = scnView
+        context.coordinator.startObservingARLifecycle()
 
         // Load model if available
         if modelEntity != nil {
@@ -108,11 +109,20 @@ struct BuddyPreviewView: UIViewRepresentable {
         guard let entity = modelEntity,
               let scene = scnView.scene else { return }
 
-        // Remove old buddy node
+        // Full teardown of the outgoing buddy before we even start parsing the
+        // new USDZ. Without this the old skeleton, its GPU textures and the
+        // cached mocap SCNAnimations coexist with the incoming ones during the
+        // parse window, driving the memory peak >1 GB on larger assets (Aleda
+        // ≈51 MB USDZ with 4K body textures).
+        let oldNode = context.coordinator.buddyNode
+        BuddyMocapService.shared.stopAndFlush(on: oldNode)
+        BuddyGestureService.shared.stopIdle()
+        FacialExpressionService.shared.stopIdleBehaviors()
+        BuddyFaceBoneService.shared.clear()
+        oldNode?.removeFromParentNode()
         scene.rootNode.childNode(withName: "buddy", recursively: false)?.removeFromParentNode()
+        context.coordinator.buddyNode = nil
 
-        // Get the USDZ file URL from the entity
-        // We need to load the USDZ directly into SceneKit
         Task {
             await loadUSDZModel(in: scnView, context: context)
         }
@@ -138,6 +148,11 @@ struct BuddyPreviewView: UIViewRepresentable {
         if buddyToLoad == nil {
             buddyToLoad = SupabaseService.shared.selectedBuddy
         }
+
+        // Device-scoped guardrail — forces Micoo on <6 GB devices even if
+        // UserDefaults has Aleda cached from a previous run on a beefier
+        // device logged in with the same account.
+        buddyToLoad = SupabaseService.shared.applyLowMemoryGuardrail(to: buddyToLoad)
 
         guard let buddy = buddyToLoad else {
             print("No buddy to load for SceneKit preview")
@@ -173,61 +188,68 @@ struct BuddyPreviewView: UIViewRepresentable {
         }
 
         do {
-            let modelScene = try SCNScene(url: url, options: [
-                .checkConsistency: true,
-                .flattenScene: false
-            ])
+            // Parse the USDZ and transplant the meaningful nodes inside an
+            // autoreleasepool so the source `SCNScene` and any Foundation
+            // temporaries it holds are released before we touch the live
+            // scene. Important for large buddies (Aleda ≈51 MB with 4K body
+            // textures) where the parse-time peak is the dominant footprint.
+            let (buddyNode, hasEmbeddedCamera): (SCNNode, Bool) = try autoreleasepool {
+                let modelScene = try SCNScene(url: url, options: [
+                    .checkConsistency: true,
+                    .flattenScene: false
+                ])
 
-            // Create container node
-            let buddyNode = SCNNode()
-            buddyNode.name = "buddy"
+                let node = SCNNode()
+                node.name = "buddy"
 
-            // Check if model has embedded camera (indicates different coordinate system)
-            var hasEmbeddedCamera = false
-            func checkForCamera(_ node: SCNNode) {
-                let name = node.name?.lowercased() ?? ""
-                if name.contains("camera") {
-                    hasEmbeddedCamera = true
-                    return
-                }
-                for child in node.childNodes {
-                    checkForCamera(child)
-                    if hasEmbeddedCamera { return }
-                }
-            }
-            checkForCamera(modelScene.rootNode)
-
-            // Move nodes from model scene — direct move (not clone) preserves
-            // SCNSkinner.skeleton references; cloning leaves them pointing at
-            // nodes in the now-released modelScene, breaking GPU skinning.
-            func addFilteredChildren(from source: SCNNode, to target: SCNNode) {
-                let children = source.childNodes  // snapshot before mutation
-                for child in children {
-                    let name = child.name?.lowercased() ?? ""
-                    if name.contains("camera") ||
-                       name.contains("light") ||
-                       name.contains("env_") ||
-                       name == "_materials" {
-                        continue
+                var embeddedCamera = false
+                func checkForCamera(_ n: SCNNode) {
+                    let name = n.name?.lowercased() ?? ""
+                    if name.contains("camera") {
+                        embeddedCamera = true
+                        return
                     }
-                    child.removeFromParentNode()
-                    child.childNodes
-                        .filter { n in
-                            let s = n.name?.lowercased() ?? ""
-                            return s.contains("camera") || s.contains("light") || s.contains("env_")
-                        }
-                        .forEach { $0.removeFromParentNode() }
-                    target.addChildNode(child)
+                    for child in n.childNodes {
+                        checkForCamera(child)
+                        if embeddedCamera { return }
+                    }
                 }
+                checkForCamera(modelScene.rootNode)
+
+                // Move nodes from model scene — direct move (not clone) preserves
+                // SCNSkinner.skeleton references; cloning leaves them pointing at
+                // nodes in the now-released modelScene, breaking GPU skinning.
+                func addFilteredChildren(from source: SCNNode, to target: SCNNode) {
+                    let children = source.childNodes  // snapshot before mutation
+                    for child in children {
+                        let name = child.name?.lowercased() ?? ""
+                        if name.contains("camera") ||
+                           name.contains("light") ||
+                           name.contains("env_") ||
+                           name == "_materials" {
+                            continue
+                        }
+                        child.removeFromParentNode()
+                        child.childNodes
+                            .filter { n in
+                                let s = n.name?.lowercased() ?? ""
+                                return s.contains("camera") || s.contains("light") || s.contains("env_")
+                            }
+                            .forEach { $0.removeFromParentNode() }
+                        target.addChildNode(child)
+                    }
+                }
+                addFilteredChildren(from: modelScene.rootNode, to: node)
+
+                return (node, embeddedCamera)
             }
-            addFilteredChildren(from: modelScene.rootNode, to: buddyNode)
 
             // DAZ Genesis9 exports have 52 ARKit blend shapes. Combined with
             // 144-bone skinning this exceeds Metal's ~22 available vertex-buffer
             // slots for morph data, causing a fatal shader compilation error that
             // makes the body mesh invisible. Trim to the shapes needed for
             // lip-sync and expressions.
-            reduceMorphTargets(for: buddyNode)
+            reduceMorphTargets(for: buddyNode, buddyName: buddy.name)
 
             // Apply scale from buddy config
             let scale = buddy.scale
@@ -326,8 +348,17 @@ struct BuddyPreviewView: UIViewRepresentable {
 
             positionCamera(attemptIndex: 0)
 
-            // Play animations
-            playAnimations(for: buddyNode)
+            // Aleda's app USDZ is now a RealityKit timeline bank. In SceneKit
+            // those embedded timeline tracks include morpher-weight animation
+            // that fights the preview lip-sync service every frame. Keep the
+            // preview's face morphers free and let the SceneKit services drive
+            // idle/lip/expression motion instead.
+            if buddy.name.caseInsensitiveCompare("Aleda") == .orderedSame {
+                stopEmbeddedAnimations(for: buddyNode)
+                print("[BuddyPreview] Skipped embedded Aleda timeline in SceneKit preview")
+            } else {
+                playAnimations(for: buddyNode)
+            }
 
             // Configure SceneKit lip sync service
             SceneKitLipSyncService.shared.configure(buddyNode: buddyNode)
@@ -336,6 +367,11 @@ struct BuddyPreviewView: UIViewRepresentable {
             FacialExpressionService.shared.configure(buddyNode: buddyNode)
             FacialExpressionService.shared.startIdleBehaviors()
 
+            // Bone-driven face layer for rigs without blendshapes (DAZ G9 → Aleda).
+            // Stays inert on morph-rigged buddies like Micoo.
+            BuddyFaceBoneService.shared.configure(buddyNode: buddyNode)
+            BuddyFaceBoneService.shared.startIdleBehaviors()
+
             // Apply persisted skin tint (if any). Registers this node as the
             // active target so the Settings picker can live-refresh.
             BuddyTintService.shared.apply(
@@ -343,6 +379,11 @@ struct BuddyPreviewView: UIViewRepresentable {
                 to: buddyNode,
                 buddyId: buddy.name
             )
+
+            // Force lashes (and other DAZ materials that lost their base-color
+            // tint during USDZ export) back to black. No-op for buddies that
+            // aren't in the per-buddy table.
+            BuddyEyeMakeupService.shared.apply(to: buddyNode, buddyId: buddy.name)
 
             // Procedural idle (breathing + micro-sway) and gesture dispatch.
             // Idle itself is started from inside positionCamera's callback
@@ -367,57 +408,81 @@ struct BuddyPreviewView: UIViewRepresentable {
     /// Reduces morph targets on nodes that have both skeletal skinning and morphing.
     /// Priority list covers all shapes used by SceneKitLipSyncService and
     /// FacialExpressionService, capped at 20 to stay within Metal's vertex-buffer budget.
-    private func reduceMorphTargets(for node: SCNNode) {
+    ///
+    /// Buddy-specific behaviour on skinned nodes:
+    /// - Aleda (DAZ G9): every face mesh is BOTH skinned and shape-keyed. Stripping
+    ///   morphers would zero out lip-sync, so we reduce to the priority set instead,
+    ///   accepting the Metal vertex-buffer risk in exchange for working lips.
+    /// - Others (Micoo etc.): face mesh is typically not skinned, so stripping
+    ///   morphers from skinned body nodes remains the safe Micoo-era workaround.
+    private func reduceMorphTargets(for node: SCNNode, buddyName: String) {
         let priority: [String] = [
-            "jawOpen", "mouthClose", "eyeBlinkLeft", "eyeBlinkRight",
-            "browDownLeft", "browDownRight", "browInnerUp",
+            "jawOpen", "mouthClose", "mouthFunnel", "mouthPucker",
             "mouthSmileLeft", "mouthSmileRight", "mouthFrownLeft", "mouthFrownRight",
-            "mouthFunnel", "mouthPucker", "mouthRollLower", "mouthRollUpper",
-            "cheekPuff", "eyeSquintLeft", "eyeSquintRight",
-            "browOuterUpLeft", "browOuterUpRight"
+            "mouthRollLower", "mouthRollUpper", "mouthPressLeft", "mouthPressRight",
+            "mouthLowerDownLeft", "mouthLowerDownRight", "mouthUpperUpLeft", "mouthUpperUpRight",
+            "mouthStretchLeft", "mouthStretchRight", "eyeBlinkLeft", "eyeBlinkRight"
         ]
 
-        node.enumerateChildNodes { child, _ in
-            guard let morpher = child.morpher else { return }
+        let keepOnSkinned = buddyName.lowercased().contains("aleda")
 
-            // SceneKit's Metal shader generator produces an unrecoverable "Compiler
-            // error while building render pipeline state" whenever a node carries
-            // BOTH an SCNSkinner (GPU calcMode) AND an SCNMorpher. No amount of
-            // morph-target reduction or material simplification prevents the failure —
-            // the shader is generated before any rendering attempt. The only workaround
-            // is to strip the morpher from every skinned node so the body renders via
-            // GPU skinning alone. LipSync falls back to jaw-bone rotation.
-            if child.skinner != nil {
-                child.morpher = nil
-                print("[BuddyPreview] Removed morpher from skinned '\(child.name ?? "?")' (\(morpher.targets.count) targets)")
-                return
+        func canonicalShapeName(_ name: String?) -> String? {
+            guard var result = name else { return nil }
+            while result.last?.isNumber == true {
+                result.removeLast()
             }
+            return result
+        }
 
-            // Non-skinned nodes: reduce to the priority set to stay within Metal
-            // vertex-buffer limits.
+        func reduce(_ child: SCNNode, _ morpher: SCNMorpher) {
             guard morpher.targets.count > 20 else { return }
 
             var kept: [SCNGeometry] = []
             for name in priority {
-                if let t = morpher.targets.first(where: { $0.name == name }) {
+                if let t = morpher.targets.first(where: { canonicalShapeName($0.name) == name }) {
                     kept.append(t)
                 }
             }
             if kept.isEmpty { kept = Array(morpher.targets.prefix(20)) }
 
-            let newMorpher = SCNMorpher()
-            newMorpher.targets = kept
-            newMorpher.unifiesNormals = true
-            child.morpher = newMorpher
+            // Original-Morpher behalten und nur die Targets in-place trimmen.
+            // Ein frisch erzeugter SCNMorpher verliert die vom USD-Importer gesetzten
+            // Normal-Metadaten (faceVarying → vertex), und SceneKit fällt dann auf
+            // position-derivierte Normalen zurück → sichtbare Facetten auf Aleda's Haut.
+            let prevCount = morpher.targets.count
+            morpher.targets = kept
 
-            print("[BuddyPreview] Reduced morpher '\(child.name ?? "?")': \(morpher.targets.count)→\(kept.count) targets")
+            print("[BuddyPreview] Reduced morpher '\(child.name ?? "?")': \(prevCount)→\(kept.count) targets")
+        }
+
+        let faceSubmeshMarkers = [
+            "genesis9mouth", "genesis9tear", "genesis9eyes",
+            "genesis9eyelashes", "g9eyebrowfibers", "genesis9head",
+        ]
+
+        node.enumerateHierarchy { child, _ in
+            guard let morpher = child.morpher else { return }
+
+            let nodeName = child.name ?? ""
+            let lowerName = nodeName.lowercased()
+            let isFaceSubmesh = faceSubmeshMarkers.contains { lowerName.contains($0) }
+            let isAledaBody = keepOnSkinned && lowerName.contains("genesis9") && !isFaceSubmesh
+
+            if (child.skinner != nil && !keepOnSkinned) || isAledaBody {
+                child.morpher = nil
+                print("[BuddyPreview] Removed morpher from '\(nodeName)' (\(morpher.targets.count) targets)")
+                return
+            }
+
+            reduce(child, morpher)
         }
     }
 
     private func playAnimations(for node: SCNNode) {
         // Find and play all animations in the scene
         node.enumerateChildNodes { child, _ in
-            if let keys = child.animationKeys as? [String], !keys.isEmpty {
+            let keys = child.animationKeys
+            if !keys.isEmpty {
                 for key in keys {
                     if let player = child.animationPlayer(forKey: key) {
                         player.play()
@@ -434,6 +499,14 @@ struct BuddyPreviewView: UIViewRepresentable {
         }
     }
 
+    private func stopEmbeddedAnimations(for node: SCNNode) {
+        node.enumerateHierarchy { child, _ in
+            for key in child.animationKeys {
+                child.removeAnimation(forKey: key)
+            }
+        }
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
@@ -443,6 +516,7 @@ struct BuddyPreviewView: UIViewRepresentable {
         var buddyNode: SCNNode?
         var cameraNode: SCNNode?
         var currentModelId: ObjectIdentifier?
+        private var arLifecycleObserver: NSObjectProtocol?
 
         // Original transform for reset
         var originalScale: SCNVector3 = SCNVector3(1, 1, 1)
@@ -450,6 +524,44 @@ struct BuddyPreviewView: UIViewRepresentable {
         var originalPosition: SCNVector3 = SCNVector3(0, 0, 0)
 
         var currentZoom: Float = 1.0
+
+        deinit {
+            if let arLifecycleObserver {
+                NotificationCenter.default.removeObserver(arLifecycleObserver)
+            }
+        }
+
+        func startObservingARLifecycle() {
+            guard arLifecycleObserver == nil else { return }
+            arLifecycleObserver = NotificationCenter.default.addObserver(
+                forName: .arBuddyWillEnterAR,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.releasePreviewForAR()
+            }
+        }
+
+        private func releasePreviewForAR() {
+            guard buddyNode != nil || scnView?.scene?.rootNode.childNode(withName: "buddy", recursively: false) != nil else {
+                return
+            }
+
+            print("[BuddyPreview] Releasing SceneKit buddy before entering AR")
+            SceneKitLipSyncService.shared.stopAnimation()
+            BuddyMocapService.shared.stopAndFlush(on: buddyNode)
+            BuddyGestureService.shared.stopIdle()
+            FacialExpressionService.shared.stopIdleBehaviors()
+            BuddyFaceBoneService.shared.clear()
+
+            buddyNode?.removeAllActions()
+            buddyNode?.removeAllAnimations()
+            buddyNode?.removeFromParentNode()
+            scnView?.scene?.rootNode.childNode(withName: "buddy", recursively: false)?.removeFromParentNode()
+            buddyNode = nil
+            currentModelId = nil
+            scnView?.isPlaying = false
+        }
 
         @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
             guard let node = buddyNode else { return }

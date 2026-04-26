@@ -914,6 +914,7 @@ final class BuddyGestureService {
     private func fireAmbientTick() {
         defer { scheduleNextAmbient() }
         guard !isSpeaking,
+              !isMocapDriven,
               buddyNode != nil,
               Date() >= bakedPlaybackEndsAt,
               let gesture = ambientPool.randomElement()

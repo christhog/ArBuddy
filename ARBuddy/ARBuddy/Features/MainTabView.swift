@@ -44,7 +44,16 @@ struct MainTabView: View {
                 .tag(4)
         }
         .environmentObject(mapViewModel)
+        .onChange(of: selectedTab) { _, newValue in
+            if newValue == 4 {
+                NotificationCenter.default.post(name: .arBuddyWillEnterAR, object: nil)
+            }
+        }
     }
+}
+
+extension Notification.Name {
+    static let arBuddyWillEnterAR = Notification.Name("ARBuddyWillEnterAR")
 }
 
 #Preview {

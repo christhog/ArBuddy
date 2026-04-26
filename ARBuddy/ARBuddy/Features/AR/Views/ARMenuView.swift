@@ -48,6 +48,38 @@ struct ARMenuView: View {
                     removal: .scale.combined(with: .opacity)
                 ))
 
+                if viewModel.currentBuddy?.name.caseInsensitiveCompare("Aleda") == .orderedSame,
+                   AledaARAnimationClip.allCases.count > 1 {
+                    Menu {
+                        ForEach(AledaARAnimationClip.allCases, id: \.self) { clip in
+                            Button {
+                                viewModel.selectAledaARAnimation(clip)
+                            } label: {
+                                Label(clip.displayName, systemImage: clip.systemImage)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: viewModel.selectedAledaARAnimation.systemImage)
+                                .font(.system(size: 16, weight: .medium))
+                            Text(viewModel.selectedAledaARAnimation.displayName)
+                                .font(.system(size: 14, weight: .medium))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(
+                            Capsule()
+                                .fill(Color.black.opacity(0.6))
+                                .shadow(color: .black.opacity(0.2), radius: 4, x: 0, y: 2)
+                        )
+                    }
+                    .transition(.asymmetric(
+                        insertion: .scale.combined(with: .opacity),
+                        removal: .scale.combined(with: .opacity)
+                    ))
+                }
+
                 // Country picker (only when globe is visible)
                 if isGlobeVisible {
                     Menu {

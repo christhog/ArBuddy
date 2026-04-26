@@ -12,6 +12,8 @@ import UIKit
 struct ARBuddyView: View {
     @EnvironmentObject var locationService: LocationService
     @StateObject private var viewModel = ARBuddyViewModel()
+    @StateObject private var chatViewModel = ChatViewModel(lipSyncTarget: .realityKitOnly)
+    @State private var showFullChat = false
 
     var body: some View {
         ZStack {
@@ -120,6 +122,17 @@ struct ARBuddyView: View {
                 }
             }
 
+            if viewModel.placementMode == .manual {
+                VStack {
+                    Spacer()
+                    MiniChatOverlay(
+                        viewModel: chatViewModel,
+                        showFullChat: $showFullChat
+                    )
+                    .padding(.bottom, 24)
+                }
+            }
+
             // Country Popup Overlay
             if let countryCode = viewModel.selectedCountryCode,
                let progress = viewModel.getCountryProgress(for: countryCode) {
@@ -155,6 +168,21 @@ struct ARBuddyView: View {
             }
         }
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.selectedCountryCode)
+        .sheet(isPresented: $showFullChat) {
+            NavigationStack {
+                ChatView(viewModel: chatViewModel)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button {
+                                showFullChat = false
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+            }
+        }
         .task {
             await viewModel.loadSelectedBuddy()
         }

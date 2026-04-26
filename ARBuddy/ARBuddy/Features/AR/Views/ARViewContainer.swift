@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Foundation
 import RealityKit
 import ARKit
 import Combine
@@ -86,6 +87,7 @@ struct ARViewContainer: UIViewRepresentable {
 
         // Handle buddy visibility
         context.coordinator.updateBuddyVisibility(viewModel.isBuddyVisible)
+        context.coordinator.updateSelectedAledaAnimation(viewModel.selectedAledaARAnimation)
 
         // Handle globe rotation to country
         if let countryCode = viewModel.selectedCountryForRotation {
@@ -94,6 +96,7 @@ struct ARViewContainer: UIViewRepresentable {
                 viewModel.selectedCountryForRotation = nil
             }
         }
+
     }
 
     func makeCoordinator() -> Coordinator {
@@ -111,15 +114,44 @@ struct ARViewContainer: UIViewRepresentable {
 
         // Walking behavior properties
         private var walkTimer: Timer?
+        private var aledaRoamTimer: Timer?
         private var currentTarget: SIMD3<Float>?
         private var spawnPosition: SIMD3<Float>?
         private var buddyEntity: ModelEntity?
+        private var aledaBaseOrientation: simd_quatf?
+        private var azureSpeechActive = false
+        private var localSpeechActive = false
+        private var isSpeechActive: Bool {
+            azureSpeechActive || localSpeechActive
+        }
 
         // Animation properties
         private var idleAnimation: AnimationResource?
         private var walkingAnimation: AnimationResource?
+        private var aledaAnimationSlices: [AledaARAnimationClip: AnimationResource] = [:]
         private var currentAnimationController: AnimationPlaybackController?
         private var isWalking = false
+        private var lastPlayedAledaAnimation: AledaARAnimationClip?
+
+        private struct AledaTimelineSlice {
+            let startFrame: Double
+            let endFrame: Double
+            let fps: Double
+            let speed: Float
+
+            var startTime: TimeInterval {
+                (startFrame - 1) / fps
+            }
+
+            var endTime: TimeInterval {
+                endFrame / fps
+            }
+        }
+
+        private let aledaTimelineSlices: [AledaARAnimationClip: AledaTimelineSlice] = [
+            .idle: AledaTimelineSlice(startFrame: 1, endFrame: 301, fps: 30, speed: 1.0),
+            .walking: AledaTimelineSlice(startFrame: 330, endFrame: 371, fps: 30, speed: 0.78)
+        ]
 
         // Lip Sync properties
         private var lipSyncConfigured = false
@@ -142,10 +174,47 @@ struct ARViewContainer: UIViewRepresentable {
         private var walkSpeed: Float {
             viewModel.currentBuddy?.walkSpeed ?? 0.3
         }
+        private var aledaRoamSpeed: Float {
+            min(max(walkSpeed, 0.08), 0.18)
+        }
 
         init(viewModel: ARBuddyViewModel) {
             self.viewModel = viewModel
             super.init()
+            observeSpeechState()
+        }
+
+        private func observeSpeechState() {
+            AzureSpeechService.shared.$isSpeaking
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] speaking in
+                    self?.azureSpeechActive = speaking
+                    self?.handleSpeechStateChanged()
+                }
+                .store(in: &cancellables)
+
+            TextToSpeechService.shared.$state
+                .map { $0.isSpeaking }
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] speaking in
+                    self?.localSpeechActive = speaking
+                    self?.handleSpeechStateChanged()
+                }
+                .store(in: &cancellables)
+        }
+
+        private func handleSpeechStateChanged() {
+            guard isAleda, isPlaced, viewModel.isBuddyVisible, !isGlobeActive else {
+                return
+            }
+
+            if isSpeechActive {
+                stopAledaRoaming(playIdle: false)
+                print("[ARPlacement] Paused Aleda roaming during speech")
+            } else if aledaRoamTimer == nil && walkTimer == nil {
+                startAledaRoaming()
+                print("[ARPlacement] Resumed Aleda roaming after speech")
+            }
         }
 
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
@@ -156,6 +225,10 @@ struct ARViewContainer: UIViewRepresentable {
             // If globe is active, check for globe tap first
             if isGlobeActive {
                 handleGlobeTap(at: tapLocation)
+                return
+            }
+
+            guard !isPlaced else {
                 return
             }
 
@@ -187,6 +260,8 @@ struct ARViewContainer: UIViewRepresentable {
         func placeBuddyAt(_ position: SIMD3<Float>) {
             guard let arView = arView else { return }
 
+            resetPlacementState(removeAnchor: false)
+
             // Remove previous anchor if exists
             if let previousAnchor = currentAnchor {
                 arView.scene.removeAnchor(previousAnchor)
@@ -199,8 +274,7 @@ struct ARViewContainer: UIViewRepresentable {
             // Add buddy model
             if let modelEntity = viewModel.modelEntity {
                 let clone = modelEntity.clone(recursive: true)
-                // Keep scale from Supabase (already applied in BuddyAssetService)
-                clone.position = SIMD3<Float>(0, 0, 0) // Directly on ground
+                normalizeBuddyForAR(clone)
 
                 print("Buddy placed - scale: \(clone.scale), position: \(clone.position)")
                 print("Original modelEntity scale: \(modelEntity.scale)")
@@ -210,13 +284,16 @@ struct ARViewContainer: UIViewRepresentable {
                 // Store references for walking behavior
                 spawnPosition = position
                 buddyEntity = clone
+                if isAleda {
+                    aledaBaseOrientation = clone.orientation
+                    print("[ARPlacement] Captured Aleda base orientation: \(clone.orientation)")
+                }
 
-                // Play the Mixamo-retargeted mocap idle. Falls back to
-                // whatever animation shipped inside the buddy USDZ (e.g.
-                // the old bundled walk cycle) if no mocap clip is in the
-                // app bundle for this buddy.
-                if BuddyMocapService.shared.play(.default, on: clone, loop: true) {
-                    print("Mocap idle started")
+                if isAleda {
+                    playAledaAnimation(viewModel.selectedAledaARAnimation, on: clone)
+                    prewarmAledaTimelineAnimations(on: clone)
+                } else if playEmbeddedAnimation(on: clone) {
+                    print("Embedded Aleda animation started")
                 } else {
                     idleAnimation = clone.availableAnimations.first
                     if let animation = idleAnimation {
@@ -227,11 +304,14 @@ struct ARViewContainer: UIViewRepresentable {
                     }
                 }
 
-                // Load walking animation, then start walking
                 Task {
-                    await loadWalkingAnimation()
+                    if shouldLoadWalkingAnimation {
+                        await loadWalkingAnimation()
+                    }
                     await MainActor.run {
-                        startWalking()
+                        if !isAleda {
+                            startWalking()
+                        }
                     }
 
                     // Configure lip sync for this buddy
@@ -253,6 +333,10 @@ struct ARViewContainer: UIViewRepresentable {
             arView.scene.addAnchor(anchor)
             currentAnchor = anchor
             isPlaced = true
+
+            if isAleda {
+                startAledaRoaming()
+            }
         }
 
         func updateAutomaticPlacement() {
@@ -294,20 +378,28 @@ struct ARViewContainer: UIViewRepresentable {
         }
 
         func reset() {
-            // Stop walking
+            resetPlacementState(removeAnchor: true)
+        }
+
+        private func resetPlacementState(removeAnchor: Bool) {
             walkTimer?.invalidate()
             walkTimer = nil
             currentTarget = nil
             spawnPosition = nil
             buddyEntity = nil
+            aledaBaseOrientation = nil
             isWalkingToGlobe = false
 
             // Stop and clear animations
             currentAnimationController?.stop()
             currentAnimationController = nil
+            aledaRoamTimer?.invalidate()
+            aledaRoamTimer = nil
             idleAnimation = nil
             walkingAnimation = nil
+            aledaAnimationSlices.removeAll()
             isWalking = false
+            lastPlayedAledaAnimation = nil
 
             // Cleanup lip sync
             lipSyncConfigured = false
@@ -315,16 +407,334 @@ struct ARViewContainer: UIViewRepresentable {
                 LipSyncService.shared.cleanup()
             }
 
-            if let previousAnchor = currentAnchor, let arView = arView {
+            if removeAnchor, let previousAnchor = currentAnchor, let arView = arView {
                 arView.scene.removeAnchor(previousAnchor)
             }
-            currentAnchor = nil
+            if removeAnchor {
+                currentAnchor = nil
+            }
             isPlaced = false
+        }
+
+        private var shouldLoadWalkingAnimation: Bool {
+            !isAleda
+        }
+
+        private var isAleda: Bool {
+            currentBuddyName?.caseInsensitiveCompare("Aleda") == .orderedSame
+        }
+
+        private var currentBuddyName: String? {
+            viewModel.currentBuddy?.name ?? SupabaseService.shared.selectedBuddy?.name
+        }
+
+        func updateSelectedAledaAnimation(_ clip: AledaARAnimationClip) {
+            guard isPlaced,
+                  isAleda,
+                  aledaRoamTimer == nil,
+                  clip != lastPlayedAledaAnimation,
+                  let entity = buddyEntity else {
+                return
+            }
+
+            playAledaAnimation(clip, on: entity)
+        }
+
+        private func normalizeBuddyForAR(_ entity: Entity) {
+            let bounds = entity.visualBounds(relativeTo: entity)
+            let height = bounds.max.y - bounds.min.y
+            let minY = bounds.min.y
+
+            if currentBuddyName?.caseInsensitiveCompare("Aleda") == .orderedSame,
+               height > 0.001 {
+                let targetHeight: Float = 0.449
+                let currentHeight = height * entity.scale.y
+                let scaleFactor = targetHeight / max(currentHeight, 0.001)
+                entity.scale *= SIMD3<Float>(repeating: scaleFactor)
+                // Aleda's RealityKit visual bounds include rig/hidden extents
+                // below the visible feet. Using -minY therefore lifts the whole
+                // character into the air. The USDZ origin is already authored for
+                // ground placement, so keep local Y at zero.
+                entity.position = SIMD3<Float>(0, 0, 0)
+                print("[ARPlacement] Normalized Aleda height \(currentHeight) → \(targetHeight), scaleFactor=\(scaleFactor), boundsMinY=\(minY), y=0")
+            } else {
+                entity.position = SIMD3<Float>(0, -minY * entity.scale.y, 0)
+                print("[ARPlacement] Grounded buddy height=\(height), minY=\(minY), y=\(entity.position.y)")
+            }
+        }
+
+        @discardableResult
+        private func playAledaAnimation(_ clip: AledaARAnimationClip, on entity: ModelEntity) -> Bool {
+            playAledaTimelineAnimation(clip, on: entity)
+        }
+
+        @discardableResult
+        private func playAledaTimelineAnimation(_ clip: AledaARAnimationClip, on entity: ModelEntity) -> Bool {
+            guard let (animatedEntity, animations) = firstEntityWithEmbeddedAnimations(in: entity),
+                  let fullTimeline = animations.first else {
+                print("[ARPlacement] Aleda \(clip.rawValue) animation unavailable: no embedded RealityKit timeline")
+                return false
+            }
+
+            guard let animation = makeAledaTimelineAnimation(clip, from: fullTimeline) else {
+                return false
+            }
+
+            currentAnimationController?.stop()
+            let loopedAnimation = animation.repeat()
+            let controller = animatedEntity.playAnimation(loopedAnimation, transitionDuration: 0.35, startsPaused: false)
+            currentAnimationController = controller
+            isWalking = false
+            lastPlayedAledaAnimation = clip
+            let durations = animations.map { String(format: "%.3f", $0.definition.duration) }.joined(separator: ", ")
+            print("[ARPlacement] Playing Aleda \(clip.rawValue) animation on '\(animatedEntity.name)' timelineCount=\(animations.count) durations=[\(durations)]")
+            return true
+        }
+
+        private func prewarmAledaTimelineAnimations(on entity: ModelEntity) {
+            guard let (_, animations) = firstEntityWithEmbeddedAnimations(in: entity),
+                  let fullTimeline = animations.first else {
+                print("[ARPlacement] Aleda timeline prewarm skipped: no embedded RealityKit timeline")
+                return
+            }
+
+            var prewarmedClips: [String] = []
+            for clip in AledaARAnimationClip.allCases where aledaAnimationSlices[clip] == nil {
+                if makeAledaTimelineAnimation(clip, from: fullTimeline) != nil {
+                    prewarmedClips.append(clip.rawValue)
+                }
+            }
+
+            if !prewarmedClips.isEmpty {
+                print("[ARPlacement] Prewarmed Aleda timeline slices: \(prewarmedClips.joined(separator: ", "))")
+            }
+        }
+
+        private func makeAledaTimelineAnimation(_ clip: AledaARAnimationClip, from fullTimeline: AnimationResource) -> AnimationResource? {
+            if let cachedAnimation = aledaAnimationSlices[clip] {
+                return cachedAnimation
+            }
+
+            guard let slice = aledaTimelineSlices[clip] else {
+                print("[ARPlacement] Missing Aleda timeline metadata for \(clip.rawValue)")
+                return nil
+            }
+
+            let animationView = AnimationView(
+                source: fullTimeline.definition,
+                name: "Aleda_\(clip.rawValue)",
+                bindTarget: nil,
+                blendLayer: 0,
+                repeatMode: .none,
+                fillMode: [],
+                trimStart: slice.startTime,
+                trimEnd: slice.endTime,
+                trimDuration: nil,
+                offset: 0,
+                delay: 0,
+                speed: slice.speed
+            )
+
+            do {
+                let animation = try AnimationResource.generate(with: animationView)
+                aledaAnimationSlices[clip] = animation
+                print("[ARPlacement] Generated Aleda \(clip.rawValue) slice frames=\(Int(slice.startFrame))...\(Int(slice.endFrame)) seconds=\(slice.startTime)...\(slice.endTime) speed=\(slice.speed)")
+                return animation
+            } catch {
+                print("[ARPlacement] Failed to generate Aleda \(clip.rawValue) slice: \(error.localizedDescription)")
+                return nil
+            }
+        }
+
+        private func startAledaRoaming() {
+            guard isAleda,
+                  isPlaced,
+                  viewModel.isBuddyVisible,
+                  !isGlobeActive,
+                  !isSpeechActive,
+                  let entity = buddyEntity else {
+                return
+            }
+
+            walkTimer?.invalidate()
+            walkTimer = nil
+            currentTarget = nil
+            isWalking = false
+            entity.orientation = aledaBaseOrientation ?? entity.orientation
+            playAledaAnimation(.idle, on: entity)
+            scheduleNextAledaWalk(after: Double.random(in: 3.0...8.0))
+        }
+
+        private func scheduleNextAledaWalk(after delay: TimeInterval) {
+            aledaRoamTimer?.invalidate()
+            aledaRoamTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+                self?.beginAledaWalkPhase(duration: Double.random(in: 3.0...8.0))
+            }
+        }
+
+        private func beginAledaWalkPhase(duration: TimeInterval) {
+            guard isAleda,
+                  isPlaced,
+                  viewModel.isBuddyVisible,
+                  !isGlobeActive,
+                  !isSpeechActive,
+                  let entity = buddyEntity else {
+                return
+            }
+
+            pickNewTarget()
+            playAledaAnimation(.walking, on: entity)
+            isWalking = true
+
+            walkTimer?.invalidate()
+            walkTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
+                self?.updateAledaRoamingWalk()
+            }
+
+            aledaRoamTimer?.invalidate()
+            aledaRoamTimer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
+                self?.endAledaWalkPhase()
+            }
+
+            print("[ARPlacement] Aleda roaming walk started duration=\(String(format: "%.2f", duration))s speed=\(aledaRoamSpeed)")
+        }
+
+        private func endAledaWalkPhase() {
+            guard isAleda,
+                  let entity = buddyEntity else {
+                return
+            }
+
+            walkTimer?.invalidate()
+            walkTimer = nil
+            currentTarget = nil
+            isWalking = false
+            entity.orientation = aledaBaseOrientation ?? entity.orientation
+            playAledaAnimation(.idle, on: entity)
+
+            guard isPlaced,
+                  viewModel.isBuddyVisible,
+                  !isGlobeActive else {
+                return
+            }
+
+            let idleDuration = Double.random(in: 3.0...8.0)
+            print("[ARPlacement] Aleda roaming idle duration=\(String(format: "%.2f", idleDuration))s")
+            scheduleNextAledaWalk(after: idleDuration)
+        }
+
+        private func stopAledaRoaming(playIdle: Bool) {
+            aledaRoamTimer?.invalidate()
+            aledaRoamTimer = nil
+            walkTimer?.invalidate()
+            walkTimer = nil
+            currentAnimationController?.stop()
+            currentAnimationController = nil
+            currentTarget = nil
+            isWalking = false
+
+            if playIdle, let entity = buddyEntity {
+                entity.orientation = aledaBaseOrientation ?? entity.orientation
+                playAledaAnimation(.idle, on: entity)
+            }
+        }
+
+        private func updateAledaRoamingWalk() {
+            guard let entity = buddyEntity,
+                  let anchor = currentAnchor,
+                  isAleda,
+                  isPlaced,
+                  viewModel.isBuddyVisible,
+                  !isGlobeActive else {
+                stopAledaRoaming(playIdle: false)
+                return
+            }
+
+            if currentTarget == nil {
+                pickNewTarget()
+            }
+
+            guard let target = currentTarget else { return }
+
+            let anchorPos = anchor.position(relativeTo: nil)
+            let entityLocalPos = entity.position
+            let currentWorldPos = SIMD3<Float>(
+                anchorPos.x + entityLocalPos.x,
+                anchorPos.y + entityLocalPos.y,
+                anchorPos.z + entityLocalPos.z
+            )
+
+            let direction = SIMD3<Float>(
+                target.x - currentWorldPos.x,
+                0,
+                target.z - currentWorldPos.z
+            )
+            let distance = simd_length(SIMD2<Float>(direction.x, direction.z))
+
+            if distance < 0.08 {
+                pickNewTarget()
+                return
+            }
+
+            let normalized = simd_normalize(direction)
+            let stepDistance = min(distance, aledaRoamSpeed * 0.016)
+            let step = normalized * stepDistance
+
+            entity.position = SIMD3<Float>(
+                entityLocalPos.x + step.x,
+                entityLocalPos.y,
+                entityLocalPos.z + step.z
+            )
+
+            let angle = atan2(normalized.x, normalized.z)
+            let yaw = simd_quatf(angle: angle, axis: [0, 1, 0])
+            entity.orientation = yaw * (aledaBaseOrientation ?? simd_quatf())
+        }
+
+        @discardableResult
+        private func playEmbeddedAnimation(on entity: Entity) -> Bool {
+            guard currentBuddyName?.caseInsensitiveCompare("Aleda") == .orderedSame,
+                  let (animatedEntity, animations) = firstEntityWithEmbeddedAnimations(in: entity),
+                  let animation = animations.first else {
+                return false
+            }
+
+            currentAnimationController?.stop()
+            currentAnimationController = animatedEntity.playAnimation(
+                animation.repeat(),
+                transitionDuration: 0.25,
+                startsPaused: false
+            )
+            isWalking = false
+            print("[ARPlacement] Playing Aleda embedded animation on '\(animatedEntity.name)'")
+            return true
+        }
+
+        private func firstEntityWithEmbeddedAnimations(in entity: Entity) -> (Entity, [AnimationResource])? {
+            if !entity.availableAnimations.isEmpty {
+                return (entity, entity.availableAnimations)
+            }
+
+            for child in entity.children {
+                if let match = firstEntityWithEmbeddedAnimations(in: child) {
+                    return match
+                }
+            }
+
+            return nil
         }
 
         // MARK: - Walking Behavior
 
         func startWalking() {
+            guard !isAleda else {
+                walkTimer?.invalidate()
+                walkTimer = nil
+                currentTarget = nil
+                isWalking = false
+                print("startWalking skipped for Aleda; animation is controlled by the AR animation menu")
+                return
+            }
             print("startWalking called - walkingAnimation available: \(walkingAnimation != nil)")
             pickNewTarget()
             // 60fps update rate for smooth movement (was 20fps/0.05)
@@ -373,7 +783,8 @@ struct ARViewContainer: UIViewRepresentable {
                 return
             }
             guard let animation = walkingAnimation else {
-                print("playWalkingAnimation: No walking animation loaded")
+                isWalking = true
+                print("Walking without rig animation")
                 return
             }
 
@@ -718,6 +1129,9 @@ struct ARViewContainer: UIViewRepresentable {
             startButtonUpdateTimer()
 
             // Move buddy to globe (walking animation)
+            if isAleda {
+                stopAledaRoaming(playIdle: true)
+            }
             moveBuddyToGlobe(globePosition: globePosition)
 
             print("Globe shown at position: \(globePosition)")
@@ -738,7 +1152,11 @@ struct ARViewContainer: UIViewRepresentable {
 
             // Resume buddy walking
             if viewModel.isBuddyVisible {
-                startWalking()
+                if isAleda {
+                    startAledaRoaming()
+                } else {
+                    startWalking()
+                }
             }
 
             print("Globe hidden")
@@ -746,6 +1164,11 @@ struct ARViewContainer: UIViewRepresentable {
 
         /// Stops buddy walking and plays idle animation
         func stopBuddyWalking() {
+            if isAleda {
+                stopAledaRoaming(playIdle: true)
+                return
+            }
+
             walkTimer?.invalidate()
             walkTimer = nil
             currentTarget = nil
@@ -754,6 +1177,10 @@ struct ARViewContainer: UIViewRepresentable {
 
         /// Moves buddy to walk toward the globe position
         func moveBuddyToGlobe(globePosition: SIMD3<Float>) {
+            guard !isAleda else {
+                print("moveBuddyToGlobe skipped for Aleda; animation is controlled by the AR animation menu")
+                return
+            }
             guard let entity = buddyEntity, let anchor = currentAnchor else { return }
 
             // Target position: 0.5m in front of the globe (on ground level)
@@ -795,10 +1222,16 @@ struct ARViewContainer: UIViewRepresentable {
             guard let entity = buddyEntity else { return }
             entity.isEnabled = visible
 
-            if visible && !isGlobeActive && walkTimer == nil && isPlaced {
+            if visible && isAleda && !isGlobeActive && isPlaced && aledaRoamTimer == nil && walkTimer == nil {
+                startAledaRoaming()
+            } else if visible && !isGlobeActive && walkTimer == nil && isPlaced {
                 startWalking()
             } else if !visible {
-                stopBuddyWalking()
+                if isAleda {
+                    stopAledaRoaming(playIdle: false)
+                } else {
+                    stopBuddyWalking()
+                }
             }
         }
 

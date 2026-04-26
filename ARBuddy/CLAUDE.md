@@ -35,6 +35,16 @@ iOS AR companion app. SwiftUI + SceneKit + RealityKit. Buddies sind USDZ-Modelle
 - UI: `SettingsView` → Section „Buddy-Aussehen" → `SkinTintRow` mit `ColorPicker` + 8 Preset-Swatches (Fitzpatrick I–VI) + „Original wiederherstellen".
 - Buddy-Key für die Material-Tabelle ist bewusst `buddy.name` (String), nicht die UUID — robuster für Lookup.
 
+## Hardware-Anforderung
+
+- **Minimum: iPhone 14 (A16 / 6 GB RAM).** Aleda trägt vier 4K-Körpertexturen (≈256 MB VRAM), und beim Buddy-Wechsel entsteht kurz ein Memory-Peak während die neue `SCNScene` geparst wird. Auf 4-GB-Geräten (iPhone 11/12/13-Familie inkl. Pro Max) kickt iOS die App per SIGKILL, sobald das ~1,5–2 GB-Budget überschritten wird.
+- **Peak-Mitigation im Swap-Pfad** (`BuddyPreviewView.loadModel`): vor dem async-Load
+  - `BuddyMocapService.stopAndFlush(on:)` — killt Clips + leert beide Caches (die `SCNAnimation`s zeigen auf das alte Skeleton).
+  - `BuddyGestureService.stopIdle()` + `FacialExpressionService.stopIdleBehaviors()` — stoppen laufende Actions / DisplayLink-Idle.
+  - alte `buddyNode.removeFromParentNode()` + `coordinator.buddyNode = nil`.
+  - `SCNScene(url:)` läuft anschließend in einem `autoreleasepool`, damit der Parse-Peak sofort wieder freigegeben wird.
+- **Keine `UIRequiredDeviceCapabilities`-Enforcement** in Info.plist — App-Store-Installation soll nicht hart blockiert sein, Soft-Hinweis reicht.
+
 ## Konventionen
 
 - UserDefaults-Keys nach Muster `<domain>_<detail>` (`selectedBuddyId`, `buddy_tint_<name>`, `azure_sdk_*`).

@@ -32,6 +32,17 @@ class SceneKitLipSyncService: ObservableObject {
     private var originalJawEulerAngles: SCNVector3?
     private var originalHeadEulerAngles: SCNVector3?
 
+    // DAZ G9 lip-bone drive (supplements blendshape jawOpen on inner-mouth mesh,
+    // which doesn't move outer lips). `lowerjaw` is a helper node with zero
+    // skin weight — real lip motion comes from these explicit lip bones.
+    private var lipBones: [(node: SCNNode, restEuler: SCNVector3, restPos: SCNVector3, kind: LipKind)] = []
+    private var didLogLipDiag = false
+    enum LipKind {
+        case lowerMiddle   // liplowermiddle — drives main lip parting
+        case lowerSide     // l_liplower, r_liplower
+        case corner        // l_lipcorner, r_lipcorner
+    }
+
     private var displayLink: CADisplayLink?
     private var visemeQueue = VisemeQueue()
     private var audioStartTime: Date?
@@ -48,6 +59,7 @@ class SceneKitLipSyncService: ObservableObject {
     private var audioGateAmplitude: Float = 0.0         // smoothed amplitude
     private let audioGateOpenThreshold: Float = 0.35    // ~-39 dB: clearly voiced
     private let audioGateCloseThreshold: Float = 0.32   // safety net; real viseme offsets handle pause timing
+    private let audioGateStartupGrace: TimeInterval = 0.25
     private var audioGateIsOpen: Bool = false
 
     // Advanced blend shape tracking
@@ -58,12 +70,10 @@ class SceneKitLipSyncService: ObservableObject {
     private var allMorphersCache: [SCNMorpher] = []            // All morphers (Micoo has 6 mesh sections)
     private var morpherBlendShapeIndices: [[String: Int]] = [] // Per-morpher canonical-name caches
 
-    // Audio latency compensation: deaktiviert - verursachte Timing-Probleme
-    // (subtrahierte Zeit, wodurch Animation vorauslief statt synchron)
-    // Azure's real viseme offsets are already phoneme-accurate. With the SDK
-    // path active this stays at 0. If the REST fallback kicks in, viseme timings
-    // come from our own phoneme estimator and may need a lead — adjust there.
-    private let audioLatencyOffset: TimeInterval = 0.0
+    // Small visual lead for SceneKit morphing. Azure offsets are audio-accurate,
+    // but SceneKit smoothing/display latency otherwise makes the mouth read a
+    // few frames late.
+    private let visemeTimingLead: TimeInterval = 0.07
 
     // Animation mode
     private var animationMode: AnimationMode = .none
@@ -250,6 +260,11 @@ class SceneKitLipSyncService: ObservableObject {
             animationMode = .morphTargets
             print("[SceneKitLipSync] Using morph targets")
             printAvailableBlendShapes(morpher)
+
+            // DAZ G9 (Aleda): `lowerjaw` is a helper bone with zero skin weight.
+            // Real mouth motion comes from explicit lip bones: liplowermiddle
+            // (primary drive), l/r_liplower (sides), l/r_lipcorner (corners).
+            captureLipBones(in: node)
             return
         }
 
@@ -343,9 +358,11 @@ class SceneKitLipSyncService: ObservableObject {
             "mouth", "Mouth", "jaw", "Jaw"
         ]
 
+        let canonicalJawShapeNames = Set(jawShapeNames.map { $0.strippingTrailingDigits() })
         var foundJawShape: String? = nil
         for target in morpher.targets {
-            if let name = target.name, jawShapeNames.contains(name) {
+            if let name = target.name,
+               canonicalJawShapeNames.contains(name.strippingTrailingDigits()) {
                 foundJawShape = name
                 break
             }
@@ -365,12 +382,67 @@ class SceneKitLipSyncService: ObservableObject {
 
     /// Recursively collects every SCNMorpher found in the node hierarchy.
     private func collectAllMorphers(from node: SCNNode, into result: inout [SCNMorpher]) {
-        if let morpher = node.morpher, morpher.targets.count > 0 {
+        if let morpher = node.morpher,
+           morpher.targets.count > 0,
+           shouldUseMorpher(node, morpher: morpher) {
             result.append(morpher)
         }
         for child in node.childNodes {
             collectAllMorphers(from: child, into: &result)
         }
+    }
+
+    /// Filters out body-only DAZ G9 morphers from face animation. Aleda keeps a
+    /// single `jawOpen` morpher on the skinned body mesh (`Genesis9`), and
+    /// driving it causes visible skin seams/facets once visemes kick in.
+    /// Face animation should stay on the dedicated mouth / brow / eye meshes.
+    private func shouldUseMorpher(_ node: SCNNode, morpher: SCNMorpher) -> Bool {
+        let nodeName = node.name ?? ""
+        let lowerName = nodeName.lowercased()
+        let targetNames = morpher.targets.compactMap(\.name)
+        let isGenesis9BodyLike =
+            lowerName.contains("genesis9") &&
+            !lowerName.contains("genesis9head") &&
+            !lowerName.contains("genesis9mouth") &&
+            !lowerName.contains("genesis9eyes") &&
+            !lowerName.contains("genesis9eyelashes") &&
+            !lowerName.contains("genesis9tear") &&
+            !lowerName.contains("g9eyebrowfibers")
+
+        let isDazBodyJawOnly =
+            (nodeName == "Genesis9" || isGenesis9BodyLike) &&
+            targetNames.count == 1 &&
+            targetNames[0].strippingTrailingDigits() == "jawOpen"
+
+        if isDazBodyJawOnly {
+            return false
+        }
+
+        if isGenesis9BodyLike {
+            return false
+        }
+
+        let hasFaceTargets = targetNames.contains { name in
+            let canonical = name.strippingTrailingDigits().lowercased()
+            return canonical.hasPrefix("eye") ||
+                   canonical.hasPrefix("brow") ||
+                   canonical.hasPrefix("cheek") ||
+                   canonical.hasPrefix("nose") ||
+                   canonical.hasPrefix("mouth") ||
+                   canonical.hasPrefix("jaw") ||
+                   canonical == "tongueout"
+        }
+
+        if lowerName.hasPrefix("genesis9mouth") ||
+            lowerName.hasPrefix("genesis9head") ||
+            lowerName.hasPrefix("g9eyebrowfibers") ||
+            lowerName.hasPrefix("genesis9eyes") ||
+            lowerName.hasPrefix("genesis9eyelashes") ||
+            lowerName.hasPrefix("genesis9tear") {
+            return hasFaceTargets
+        }
+
+        return true
     }
 
     /// Finds the best face morpher in the node hierarchy and populates allMorphersCache.
@@ -381,6 +453,21 @@ class SceneKitLipSyncService: ObservableObject {
         collectAllMorphers(from: node, into: &allMorphersCache)
 
         guard !allMorphersCache.isEmpty else { return nil }
+
+        var mouthMorpher: SCNMorpher?
+        node.enumerateHierarchy { child, stop in
+            guard mouthMorpher == nil,
+                  let morpher = child.morpher,
+                  shouldUseMorpher(child, morpher: morpher),
+                  (child.name?.lowercased().contains("genesis9mouth") == true) else { return }
+            mouthMorpher = morpher
+            stop.pointee = true
+        }
+
+        if let mouthMorpher {
+            print("[SceneKitLipSync] Using Genesis9Mouth morpher (\(allMorphersCache.count) morpher(s) total)")
+            return mouthMorpher
+        }
 
         // Best case: morpher with exact "jawOpen" = the face mesh (Micoo / Blender ARKit export)
         if let faceMorpher = allMorphersCache.first(where: { morpher in
@@ -406,6 +493,41 @@ class SceneKitLipSyncService: ObservableObject {
         let jawKeywords = ["jaw", "chin", "mandible", "mouth", "kiefer", "mund"]
 
         return findNode(in: node, matchingKeywords: jawKeywords)
+    }
+
+    /// Capture DAZ G9 lip bones from the mesh skinners. We only keep bones
+    /// that the skinner actually references (helper nodes with the same name
+    /// but no skin weight are ignored).
+    private func captureLipBones(in node: SCNNode) {
+        lipBones.removeAll()
+        var skinnerBones: [SCNNode] = []
+        node.enumerateHierarchy { child, _ in
+            if let skinner = child.skinner {
+                skinnerBones.append(contentsOf: skinner.bones)
+            }
+        }
+        var seen = Set<ObjectIdentifier>()
+        for bone in skinnerBones {
+            let id = ObjectIdentifier(bone)
+            if seen.contains(id) { continue }
+            let name = (bone.name ?? "").lowercased()
+            let kind: LipKind?
+            if name == "liplowermiddle" {
+                kind = .lowerMiddle
+            } else if name == "l_liplower" || name == "r_liplower" {
+                kind = .lowerSide
+            } else if name == "l_lipcorner" || name == "r_lipcorner" {
+                kind = .corner
+            } else {
+                kind = nil
+            }
+            if let k = kind {
+                lipBones.append((bone, bone.eulerAngles, bone.position, k))
+                seen.insert(id)
+            }
+        }
+        let names = lipBones.map { $0.node.name ?? "?" }
+        print("[SceneKitLipSync] Captured \(lipBones.count) lip bones: \(names)")
     }
 
     private func findHeadNode(in node: SCNNode) -> SCNNode? {
@@ -459,7 +581,7 @@ class SceneKitLipSyncService: ObservableObject {
         // Update target jaw openness based on visemes or amplitude
         if visemeQueue.hasEvents {
             // Past the last viseme event → close mouth (end of speech)
-            if visemeQueue.isPastEnd(at: currentTime) {
+            if visemeQueue.isPastEnd(at: currentTime + visemeTimingLead) {
                 targetJawOpenness = 0.0
                 targetBlendShapes = [:]
             } else {
@@ -469,7 +591,8 @@ class SceneKitLipSyncService: ObservableObject {
             // Audio amplitude gate: if the actual audio is silent, force the
             // mouth closed. This is what makes pauses between words visible —
             // Azure's viseme stream alone never goes quiet during speech.
-            if !audioGateIsOpen {
+            let gateStartupGraceActive = currentTime < audioGateStartupGrace
+            if !audioGateIsOpen && !gateStartupGraceActive {
                 targetJawOpenness = 0.0
                 targetBlendShapes = [:]
             }
@@ -491,8 +614,7 @@ class SceneKitLipSyncService: ObservableObject {
     // MARK: - Animation Updates
 
     private func updateVisemeJaw(at time: TimeInterval) {
-        // Compensate for audio hardware latency - delay lip sync to match audio
-        let adjustedTime = max(0, time - audioLatencyOffset)
+        let adjustedTime = max(0, time + visemeTimingLead)
 
         guard let viseme = visemeQueue.viseme(at: adjustedTime) else {
             targetJawOpenness = 0.0
@@ -540,7 +662,7 @@ class SceneKitLipSyncService: ObservableObject {
         // Same viseme held longer than a typical phoneme duration → gap/pause
         // between phonemes or words. Fall back to neutral so the mouth actually
         // closes during silence (Azure doesn't emit explicit silence visemes).
-        let phonemeHoldWindow: TimeInterval = 0.09
+        let phonemeHoldWindow: TimeInterval = 0.06
         if adjustedTime - viseme.audioOffset > phonemeHoldWindow {
             targetJawOpenness = 0.0
             targetBlendShapes = [:]
@@ -550,8 +672,8 @@ class SceneKitLipSyncService: ObservableObject {
     private func applyAnimation() {
         // Asymmetric smoothing: fast close (pauses visible), slower open (natural speech feel)
         // Closing: 85% of remaining distance per frame (~3 frames to close at 60fps)
-        // Opening: 40% of remaining distance per frame (~10 frames to fully open)
-        let lerpFactor: Float = targetJawOpenness < currentJawOpenness ? 0.85 : 0.40
+        // Opening: 55% of remaining distance per frame (~5 frames to fully open)
+        let lerpFactor: Float = targetJawOpenness < currentJawOpenness ? 0.90 : 0.55
         currentJawOpenness = currentJawOpenness + (targetJawOpenness - currentJawOpenness) * lerpFactor
 
         // Hard silence snap: below threshold → exactly 0 (clean visual silence)
@@ -562,6 +684,12 @@ class SceneKitLipSyncService: ObservableObject {
         switch animationMode {
         case .morphTargets:
             applyAdvancedMorphTargets()
+            // Supplementary lip-bone drive for DAZ G9 (body-mesh blendShapes
+            // were stripped to fix skin facets; `lowerjaw` is a helper bone
+            // with zero skin weight, so we drive the explicit lip bones).
+            if !lipBones.isEmpty {
+                applyLipBoneOpen(openness: currentJawOpenness)
+            }
         case .jawRotation:
             applyJawRotation(openness: currentJawOpenness)
         case .headNod:
@@ -590,8 +718,8 @@ class SceneKitLipSyncService: ObservableObject {
 
         // Asymmetric lerp factors: close faster than we open, so pauses actually
         // read as closed mouths instead of lingering half-open shapes.
-        let closeRate: Float = 0.28
-        let openRate: Float = 0.30
+        let closeRate: Float = 0.55
+        let openRate: Float = 0.45
 
         for shapeName in VisemeBlendShapeMapping.allUsedShapes {
             let target = targetBlendShapes[shapeName] ?? 0.0
@@ -660,27 +788,73 @@ class SceneKitLipSyncService: ObservableObject {
         }
     }
 
-    /// Applies jaw rotation animation (good quality)
+    /// Legacy jaw rotation (Micoo and similar bone-driven rigs). Kept for the
+    /// `.jawRotation` animation mode; unused for DAZ G9 where jaw is a helper.
+    private var didLogJawDiag = false
     private func applyJawRotation(openness: Float) {
         guard let jaw = jawNode,
               let original = originalJawEulerAngles else { return }
-
-        // Rotate jaw around X axis (opening downward)
-        // Max angle ~17 degrees (0.3 radians)
         let maxAngle: Float = 0.3
         let angle = openness * maxAngle
+        if !didLogJawDiag && openness > 0.05 {
+            didLogJawDiag = true
+            print("[SceneKitLipSync/jaw-diag] bone='\(jaw.name ?? "?")' restEuler=(\(original.x), \(original.y), \(original.z))")
+        }
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = 0.016
+        SCNTransaction.disableActions = true
+        jaw.eulerAngles = SCNVector3(original.x + angle, original.y, original.z)
+        SCNTransaction.commit()
+    }
+
+    /// Drive DAZ G9 lip bones to open the mouth by translating lower-lip bones
+    /// downward in local -Y. Rest-position diagnostic (liplowermiddle has the
+    /// most-negative Y, corners have less-negative Y) shows that -Y is "down"
+    /// in head-local space. Translation gives visible lip parting; rotation
+    /// around the bone's own pivot wouldn't move the lip vertex meaningfully
+    /// since the bone sits AT the lip, not at the jaw hinge.
+    private func applyLipBoneOpen(openness: Float) {
+        guard !lipBones.isEmpty else { return }
+
+        if !didLogLipDiag && openness > 0.05 {
+            didLogLipDiag = true
+            for lb in lipBones {
+                print("[SceneKitLipSync/lip-diag] \(lb.node.name ?? "?") restEuler=\(lb.restEuler) pos=\(lb.restPos)")
+            }
+        }
+
+        // Per-bone max -Y translation in head-local units (DAZ cm, later scaled
+        // by 0.005 in DazAlignment → 0.5× world cm). At openness=1.0:
+        // middle drops ~1.8 units = 0.9cm world, sides less, corners anchor.
+        let middleDrop: Float = 1.8
+        let sideDrop:   Float = 1.2
+        let cornerDrop: Float = 0.3
 
         SCNTransaction.begin()
-        SCNTransaction.animationDuration = 0.016 // ~60fps
+        SCNTransaction.animationDuration = 0.016
         SCNTransaction.disableActions = true
-
-        jaw.eulerAngles = SCNVector3(
-            original.x + angle,
-            original.y,
-            original.z
-        )
-
+        for lb in lipBones {
+            let drop: Float
+            switch lb.kind {
+            case .lowerMiddle: drop = middleDrop
+            case .lowerSide:   drop = sideDrop
+            case .corner:      drop = cornerDrop
+            }
+            let dy = openness * drop
+            lb.node.position = SCNVector3(
+                lb.restPos.x,
+                lb.restPos.y - dy,
+                lb.restPos.z
+            )
+        }
         SCNTransaction.commit()
+    }
+
+    private func resetLipBones() {
+        for lb in lipBones {
+            lb.node.position = lb.restPos
+            lb.node.eulerAngles = lb.restEuler
+        }
     }
 
     /// Applies subtle head nod animation (minimal fallback)
@@ -753,6 +927,8 @@ class SceneKitLipSyncService: ObservableObject {
                     morpher.setWeight(0, forTargetAt: index)
                 }
             }
+            // Supplementary lip bones (Aleda/G9) — reset to rest.
+            resetLipBones()
 
         case .jawRotation:
             if let jaw = jawNode,

@@ -1,0 +1,23 @@
+{
+  "fps": 30,
+  "clips": [
+    {
+      "id": "idle",
+      "displayName": "Idle",
+      "systemImage": "figure.stand",
+      "startFrame": 1,
+      "endFrame": 301,
+      "loop": true,
+      "speed": 1.0
+    },
+    {
+      "id": "walking",
+      "displayName": "Walking",
+      "systemImage": "figure.walk",
+      "startFrame": 330,
+      "endFrame": 371,
+      "loop": true,
+      "speed": 0.78
+    }
+  ]
+}

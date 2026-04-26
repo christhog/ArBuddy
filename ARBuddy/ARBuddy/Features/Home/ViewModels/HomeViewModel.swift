@@ -45,16 +45,20 @@ class HomeViewModel: ObservableObject {
             let selectedBuddyId = UserDefaults.standard.string(forKey: "selectedBuddyId")
 
             // Find the selected buddy or use default
-            let buddy: Buddy
+            let resolved: Buddy?
             if let selectedId = selectedBuddyId,
                let uuid = UUID(uuidString: selectedId),
                let selected = buddies.first(where: { $0.id == uuid }) {
-                buddy = selected
+                resolved = selected
             } else if let defaultBuddy = buddies.first(where: { $0.isDefault }) {
-                buddy = defaultBuddy
-            } else if let firstBuddy = buddies.first {
-                buddy = firstBuddy
+                resolved = defaultBuddy
             } else {
+                resolved = buddies.first
+            }
+
+            // Low-RAM guardrail (iPhone <14): swap to Micoo even if the user's
+            // persisted choice is Aleda, since 4K body textures OOM the app.
+            guard let buddy = SupabaseService.shared.applyLowMemoryGuardrail(to: resolved) else {
                 errorMessage = "Kein Buddy gefunden"
                 isLoading = false
                 return

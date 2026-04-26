@@ -10,6 +10,12 @@ import Combine
 
 // MARK: - Chat View Model
 
+enum ChatLipSyncTarget {
+    case all
+    case realityKitOnly
+    case sceneKitOnly
+}
+
 @MainActor
 class ChatViewModel: ObservableObject {
 
@@ -65,10 +71,12 @@ class ChatViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var currentBuddy: Buddy?
     private var systemPrompt: String = ""
+    private let lipSyncTarget: ChatLipSyncTarget
 
     // MARK: - Initialization
 
-    init() {
+    init(lipSyncTarget: ChatLipSyncTarget = .all) {
+        self.lipSyncTarget = lipSyncTarget
         recommendedModel = LlamaModelInfo.recommendedModel()
 
         // Load cloud preference from UserDefaults
@@ -629,11 +637,9 @@ class ChatViewModel: ObservableObject {
 
             // Start lip sync animation if we have visemes, using the exact audio start time
             if !result.visemes.isEmpty {
-                lipSyncService.startAnimation(with: result.visemes, audioStartTime: result.audioStartTime)
-                SceneKitLipSyncService.shared.startAnimation(with: result.visemes, audioStartTime: result.audioStartTime)
+                startLipSync(with: result.visemes, audioStartTime: result.audioStartTime)
             } else {
-                lipSyncService.startAmplitudeMode()
-                SceneKitLipSyncService.shared.startAmplitudeMode()
+                startAmplitudeLipSync()
             }
 
             scheduleEmotionCues(result.emotionCues, audioStartTime: result.audioStartTime)
@@ -655,14 +661,49 @@ class ChatViewModel: ObservableObject {
                let exp = FacialExpressionService.Expression.fromMarker(first) {
                 FacialExpressionService.shared.setExpression(exp, hold: 60.0, fadeIn: 0.15, fadeOut: 0.4)
             }
-            lipSyncService.startAmplitudeMode()
-            SceneKitLipSyncService.shared.startAmplitudeMode()
+            startAmplitudeLipSync()
             ttsService.speak(text.withoutEmotionMarkers.withoutGestureMarkers)
             if let marker = gestureMarker {
                 BuddyGestureService.shared.play(marker: marker)
             }
 
             observeLocalSpeakingState()
+        }
+    }
+
+    private func startLipSync(with visemes: [VisemeEvent], audioStartTime: Date) {
+        switch lipSyncTarget {
+        case .all:
+            lipSyncService.startAnimation(with: visemes, audioStartTime: audioStartTime)
+            SceneKitLipSyncService.shared.startAnimation(with: visemes, audioStartTime: audioStartTime)
+        case .realityKitOnly:
+            lipSyncService.startAnimation(with: visemes, audioStartTime: audioStartTime)
+        case .sceneKitOnly:
+            SceneKitLipSyncService.shared.startAnimation(with: visemes, audioStartTime: audioStartTime)
+        }
+    }
+
+    private func startAmplitudeLipSync() {
+        switch lipSyncTarget {
+        case .all:
+            lipSyncService.startAmplitudeMode()
+            SceneKitLipSyncService.shared.startAmplitudeMode()
+        case .realityKitOnly:
+            lipSyncService.startAmplitudeMode()
+        case .sceneKitOnly:
+            SceneKitLipSyncService.shared.startAmplitudeMode()
+        }
+    }
+
+    private func stopLipSync() {
+        switch lipSyncTarget {
+        case .all:
+            lipSyncService.stopAnimation()
+            SceneKitLipSyncService.shared.stopAnimation()
+        case .realityKitOnly:
+            lipSyncService.stopAnimation()
+        case .sceneKitOnly:
+            SceneKitLipSyncService.shared.stopAnimation()
         }
     }
 
@@ -705,8 +746,7 @@ class ChatViewModel: ObservableObject {
             .first()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.lipSyncService.stopAnimation()
-                SceneKitLipSyncService.shared.stopAnimation()
+                self?.stopLipSync()
                 FacialExpressionService.shared.clearExpression()
             }
             .store(in: &cancellables)
@@ -721,8 +761,7 @@ class ChatViewModel: ObservableObject {
             .first()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.lipSyncService.stopAnimation()
-                SceneKitLipSyncService.shared.stopAnimation()
+                self?.stopLipSync()
                 FacialExpressionService.shared.clearExpression()
             }
             .store(in: &cancellables)
@@ -760,9 +799,7 @@ class ChatViewModel: ObservableObject {
 
     /// Stops current TTS playback and lip sync
     func stopSpeaking() {
-        // Stop lip sync for both renderers
-        lipSyncService.stopAnimation()
-        SceneKitLipSyncService.shared.stopAnimation()
+        stopLipSync()
 
         if isUsingCloud {
             azureSpeechService.stop()
